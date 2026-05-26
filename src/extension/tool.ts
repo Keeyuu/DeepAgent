@@ -508,10 +508,10 @@ export default function (pi: ExtensionAPI) {
 		pi.registerTool({
 			name: "contact_supervisor",
 			label: "Contact Supervisor",
-			description: "Communicate with your supervisor. 'progress' sends a status update (no response expected). 'decision' asks a question and waits for the supervisor's answer — you MUST wait for the response before continuing.",
+			description: "Communicate with your supervisor. 'progress' sends a status update (no response expected). 'decision' asks a question — your run will pause and wait for the supervisor's answer before you continue.",
 			parameters: ContactSupervisorParams,
 
-			async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<undefined>> {
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<undefined>> {
 				if (params.type === "progress") {
 					return {
 						content: [{ type: "text", text: `[progress] ${params.message}` }],
@@ -520,22 +520,27 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.type === "decision") {
+					// Decision request — use ctx.ui.input() as blocking transport.
+					// Parent receives extension_ui_request, responds when ready.
+					// If parent cancels (sync mode), child run ends and parent sees
+					// the decision request in the result — can restart with an answer.
 					const opts = params.options?.length ? `\nOptions: ${params.options.join(", ")}` : "";
 					const prompt = `${params.message}${opts}`;
 
 					try {
-						const response = await ctx.ui.input("Supervisor Decision", prompt, { signal });
+						const response = await ctx.ui.input("Supervisor Decision", prompt);
 						return {
 							content: [{ type: "text", text: response ?? "No response from supervisor." }],
 							details: undefined,
 						};
 					} catch {
-						// Supervisor cannot respond (e.g. parent is blocked in sync mode).
-						// This is a hard stop — tell the LLM it must decide on its own.
+						// Parent cancelled (sync mode) — end the run so parent can see
+						// the decision request and respond in a follow-up invocation.
 						return {
-							content: [{ type: "text", text: `Supervisor is unavailable for real-time decisions. You must make this decision yourself based on available context. Do not call contact_supervisor with type 'decision' again for this task.` }],
+							content: [{ type: "text", text: `[decision-request] ${params.message}${opts}\nWaiting for supervisor's response.` }],
 							details: undefined,
-						};
+							terminate: true,
+						} as AgentToolResult<undefined>;
 					}
 				}
 
