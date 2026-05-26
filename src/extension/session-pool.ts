@@ -66,6 +66,7 @@ export function addToPool(
   agent: string,
   agentSource: "user" | "project" | "unknown",
   usage: UsageStats,
+  existingRunId?: string,
 ): string {
   if (totalChildCount() >= MAX_TOTAL_CHILDREN) {
     throw new Error(
@@ -73,7 +74,7 @@ export function addToPool(
     );
   }
 
-  const runId = generateRunId();
+  const runId = existingRunId ?? generateRunId();
   const now = Date.now();
 
   pool.set(runId, {

@@ -337,7 +337,7 @@ async function launchAgent(
 				unsubEvents();
 				removeRun(runId);
 				try {
-					addToPool(session, agentName, agent.source, runInfo.accumulated.usage);
+					addToPool(session, agentName, agent.source, runInfo.accumulated.usage, runId);
 				} catch {
 					// Pool full — stop session to avoid orphaned child process
 					session.stop().catch(() => {});
