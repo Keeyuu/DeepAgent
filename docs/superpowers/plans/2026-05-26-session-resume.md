@@ -4,9 +4,11 @@
 
 **Goal:** After a foreground subagent completes a task, let the parent agent choose whether to destroy the child process or keep it alive for follow-up tasks. This preserves accumulated context across multiple tasks without re-investigation.
 
-**Architecture:** When `subagent` finishes a foreground task with `keepAlive: true`, instead of calling `session.stop()`, store the `RpcSession` in an in-process pool keyed by `runId`. Return the `runId` to the parent agent. The parent then decides: release (destroy) or resume (follow-up) — both via the `action` parameter on the `subagent` tool itself (no separate tools). The pool and async run-registry share a combined child process limit of 8.
+**Architecture:** When `subagent` finishes a foreground task with `keepAlive: true`, instead of the 60s auto-cleanup destroying the session, suppress the cleanup timer and move the `RpcSession` from the run-registry to an in-process pool keyed by `runId`. Return the `runId` to the parent agent. The parent then decides: release (destroy) or resume (follow-up) — both via the `action` parameter on the `subagent` tool itself (no separate tools). The pool and async run-registry share a combined child process limit of 8.
 
 **Transport:** Official RPC mode (`--mode rpc`) via `RpcSession`. No file system bridge, no run-store, no new transport.
+
+**Key design constraint:** `runSingleAgent` has two paths: `fireAndForget=true` (single mode, returns immediately) and `fireAndForget=false` (chain/parallel, waits for completion). keepAlive only makes sense on the `fireAndForget=false` path (chain/parallel), because the parent needs to know the result before deciding to keep the session. For single mode (fire-and-forget), the session stays alive in the async run-registry already — parent polls via `subagent_status`.
 
 ---
 
@@ -45,42 +47,43 @@ parent → subagent({ action: "release", runId: "run_abc123" })
 
 ### In Scope
 
-- `keepAlive` option on `subagent` foreground calls
+- `keepAlive` option on chain/parallel subagent calls (NOT single mode — single mode is already fire-and-forget with session in run-registry)
 - `action` parameter on `subagent` tool: `run` (default), `resume`, `release`
 - In-process `RpcSession` pool (`Map<runId, PooledSession>`)
-- Shared child process limit: `activeRuns.size + pool.size < MAX_TOTAL_CHILDREN` (8)
+- Shared child process limit: `activeRuns.size + pool.size < MAX_TOTAL_CHILDREN` (8), owned by `session-pool.ts` unidirectionally
 - `RpcSession.isAlive()` for death detection
 - `RpcSession.killSync()` for exit handler
 - `runId` in foreground result when `keepAlive: true`
-- Idle sessions exempt from `waitForIdle` timeout
+- Resume events collected via `accumulateEvent()` (O(1)), not `accumulateResultFromEvents()` (O(N²))
+- Pool idle timeout: 30 min safety net
 - Pool cleanup on parent process exit via sync `killSync()`
-- Resume events collected in local array, merged on success
+- `registerExitHandlers()` called in extension init
 
 ### Out of Scope
 
-- Auto-release timeout based on idle duration (V1: sessions stay idle indefinitely; `createdAt` field reserved for future use)
 - Persisting sessions across parent restarts
 - Session serialization / deserialization
-- Resuming async (background) sessions — those already stay alive
+- Resuming async (background) single-mode runs — those already stay alive in run-registry
 - Multiple concurrent tasks on the same session
 
 ## Runtime Model
 
-### Foreground with keepAlive
+### Chain/Parallel with keepAlive
 
 ```json
-// Request
+// Request (chain or parallel mode)
 {
-  "agent": "worker",
-  "task": "investigate project structure",
+  "chain": [
+    { "agent": "worker", "task": "investigate project structure" }
+  ],
   "agentScope": "both",
   "keepAlive": true
 }
 
-// Response (adds runId)
+// Response (adds runId to details)
 {
   "content": [{ "type": "text", "text": "... investigation result ..." }],
-  "details": { "mode": "single", "results": [...], "runId": "run_abc123" }
+  "details": { "mode": "chain", "results": [...], "runId": "run_abc123" }
 }
 ```
 
@@ -91,10 +94,11 @@ parent → subagent({ action: "release", runId: "run_abc123" })
 {
   "action": "resume",
   "runId": "run_abc123",
-  "task": "based on the investigation, update README"
+  "task": "based on the investigation, update README",
+  "keepAlive": true
 }
 
-// Response
+// Response (runId present again if keepAlive still true)
 {
   "content": [{ "type": "text", "text": "... updated README ..." }],
   "details": { "mode": "single", "results": [...], "runId": "run_abc123" }
@@ -117,39 +121,32 @@ parent → subagent({ action: "release", runId: "run_abc123" })
 }
 ```
 
-### Resource Limit: Shared Across Pool and Registry
+### Resource Limit: Unidirectional (pool owns the limit)
 
-Both the async run-registry (`activeRuns`) and the session pool (`pooledSessions`) spawn child processes. They share a combined limit:
+`session-pool.ts` owns `MAX_TOTAL_CHILDREN` and exports `totalChildCount()`. `run-registry.ts` imports from pool only — no circular dependency.
 
 ```ts
-// In session-pool.ts — check before adding
-import { getActiveRunCount } from "./run-registry.ts";
-
+// In session-pool.ts — single source of truth
 const MAX_TOTAL_CHILDREN = 8;
 
-function totalChildCount(): number {
-  return pool.size + getActiveRunCount();
+export function totalChildCount(): number {
+  return pool.size + activeRunsCount();
 }
 
-// When adding to pool:
-if (totalChildCount() >= MAX_TOTAL_CHILDREN) {
-  throw new Error(`Max concurrent child processes reached (${MAX_TOTAL_CHILDREN}). Release or abort existing runs first.`);
-}
+// activeRunsCount() is imported from run-registry.ts
+import { getActiveRunCount } from "./run-registry.ts";
 ```
 
-Similarly, `run-registry.ts` should check pool size:
-
 ```ts
-// In run-registry.ts — updated check
-import { getPoolSize } from "./session-pool.ts";
-
-function totalChildCount(): number {
-  return activeRuns.size + getPoolSize();
-}
+// In run-registry.ts — imports from pool only
+import { totalChildCount, MAX_TOTAL_CHILDREN } from "./session-pool.ts";
 
 export function registerRun(info: AsyncRunInfo): string {
-  if (totalChildCount() >= MAX_TOTAL_CHILDREN) { ... }
-  ...
+  if (totalChildCount() >= MAX_TOTAL_CHILDREN) {
+    throw new Error(`Max concurrent child processes reached (${MAX_TOTAL_CHILDREN}).`);
+  }
+  activeRuns.set(info.id, info);
+  return info.id;
 }
 ```
 
@@ -168,17 +165,23 @@ killSync(): void {
 }
 ```
 
-Pool exit handler:
+Pool exit handler — called in extension init:
 
 ```ts
-registerExitHandlers(): void {
+// In session-pool.ts
+export function registerExitHandlers(): void {
   process.on("exit", () => {
-    for (const pooled of this.sessions.values()) {
+    for (const pooled of pool.values()) {
       pooled.session.killSync();
     }
-    this.sessions.clear();
+    pool.clear();
   });
 }
+```
+
+```ts
+// In tool.ts extension entry — after config load
+registerExitHandlers();
 ```
 
 ### Session Death Detection
@@ -187,28 +190,107 @@ Before resuming, check if the child is still alive:
 
 ```ts
 // In rpc-session.ts
-/** Check if the child process is still running */
 isAlive(): boolean {
   return this.proc !== null && !this.proc.killed && this.exitCode === null;
 }
 ```
 
-In `pool.get()` — auto-remove dead sessions:
+In `getFromPool()` — auto-remove dead sessions:
 
 ```ts
 get(runId: string): PooledSession | undefined {
-  const pooled = this.sessions.get(runId);
+  const pooled = pool.get(runId);
   if (!pooled) return undefined;
-
-  // Auto-remove dead sessions
   if (!pooled.session.isAlive()) {
-    this.sessions.delete(runId);
+    pool.delete(runId);
     return undefined;
   }
-
   return pooled;
 }
 ```
+
+### Pool Idle Timeout (Safety Net)
+
+Sessions that sit idle in the pool for 30 minutes are auto-cleaned:
+
+```ts
+// In session-pool.ts
+const POOL_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+function scheduleIdleCleanup(runId: string): void {
+  setTimeout(() => {
+    const pooled = pool.get(runId);
+    if (pooled && Date.now() - pooled.lastActivityAt >= POOL_IDLE_TIMEOUT_MS) {
+      pooled.session.killSync();
+      pool.delete(runId);
+    }
+  }, POOL_IDLE_TIMEOUT_MS);
+}
+```
+
+Called after `addToPool()`. Reschedule on each resume (`lastActivityAt` update).
+
+### keepAlive Integration in runSingleAgent
+
+The current `runSingleAgent` auto-cleanup:
+
+```ts
+// Current code (chain/parallel path, fireAndForget=false):
+setTimeout(() => {
+  unsubEvents();
+  removeRun(runId);
+  session.stop().catch(() => {});
+}, 60_000);
+```
+
+When `keepAlive=true` and the run completes successfully (`agent_end`, exitCode 0), suppress this timer and move session to pool instead:
+
+```ts
+// New code:
+let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+
+if (!keepAlive) {
+  cleanupTimer = setTimeout(() => {
+    unsubEvents();
+    removeRun(runId);
+    session.stop().catch(() => {});
+  }, 60_000);
+}
+
+// In the agent_end event handler:
+if (event.type === "agent_end") {
+  runInfo.status = "completed";
+  if (keepAlive && session.getExitCode() === null) {
+    // Move from registry to pool, suppress cleanup timer
+    if (cleanupTimer) clearTimeout(cleanupTimer);
+    unsubEvents();
+    removeRun(runId);
+    const poolRunId = addToPool(session, agentName, agent.source, runInfo.accumulated.usage);
+    poolRunIdRef = poolRunId; // Capture for return
+  }
+}
+```
+
+The `poolRunIdRef` is returned as part of the `SingleResult.runId` field.
+
+### Resume Event Accumulation (O(1))
+
+Resume uses `accumulateEvent()` for O(1) per event — NOT `accumulateResultFromEvents()` which is O(N²):
+
+```ts
+const accumulated: AccumulatedResult = {
+  messages: [],
+  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+  stderr: "",
+};
+
+const unsubResume = pooled.session.onEvent((event) => {
+  accumulateEvent(accumulated, event); // O(1)
+  // emitUpdate...
+});
+```
+
+Pool invariant: only sessions past `agent_end` are stored. `followUp` is safe because the agent inner loop has exited.
 
 ## Implementation Plan
 
@@ -216,12 +298,12 @@ get(runId: string): PooledSession | undefined {
 
 **Files:**
 - Modify: `C:\Code\DeepAgent\src\extension\rpc-session.ts`
-- Modify: `C:\Code\DeepAgent\src\extension\rpc-session.test.ts` (if exists)
 
 - [ ] **Step 1: Add isAlive() method**
 
+After `isStarted()`:
+
 ```ts
-// In rpc-session.ts, after getExitCode()
 /** Check if the child process is still running */
 isAlive(): boolean {
   return this.proc !== null && !this.proc.killed && this.exitCode === null;
@@ -230,8 +312,9 @@ isAlive(): boolean {
 
 - [ ] **Step 2: Add killSync() method**
 
+After `isAlive()`:
+
 ```ts
-// In rpc-session.ts, after isAlive()
 /** Synchronous kill for process.on('exit'). No async cleanup. */
 killSync(): void {
   if (this.proc && !this.proc.killed) {
@@ -245,37 +328,42 @@ killSync(): void {
 
 Run: `npm run check`
 
-### Task 2: Session Pool
+### Task 2: Session Pool (unidirectional imports)
 
 **Files:**
 - Create: `C:\Code\DeepAgent\src\extension\session-pool.ts`
 - Create: `C:\Code\DeepAgent\src\extension\session-pool.test.ts`
+- Modify: `C:\Code\DeepAgent\src\extension\run-registry.ts` (import shared limit from pool)
 
-- [ ] **Step 1: Create PooledSession interface and SessionPool class**
-
-PooledSession is lean — only what's needed for V1:
+- [ ] **Step 1: Create session-pool.ts**
 
 ```ts
 // session-pool.ts
 import type { RpcSession } from "./rpc-session.ts";
-import type { AgentScope, RpcEvent, UsageStats } from "./types.ts";
+import type { UsageStats } from "./types.ts";
 import { getActiveRunCount } from "./run-registry.ts";
+import { randomUUID } from "node:crypto";
 
 export interface PooledSession {
   runId: string;
   session: RpcSession;
   agent: string;
-  agentScope: AgentScope;
+  agentSource: "user" | "project" | "unknown";
   createdAt: number;
   lastActivityAt: number;
   usage: UsageStats;
 }
 
-const MAX_TOTAL_CHILDREN = 8;
+/** Shared child process limit across pool and run-registry */
+export const MAX_TOTAL_CHILDREN = 8;
+
+/** Pool idle timeout safety net */
+const POOL_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
 const pool = new Map<string, PooledSession>();
 
-function totalChildCount(): number {
+/** Total child processes across pool and async run-registry */
+export function totalChildCount(): number {
   return pool.size + getActiveRunCount();
 }
 
@@ -286,7 +374,7 @@ export function getPoolSize(): number {
 export function addToPool(
   session: RpcSession,
   agent: string,
-  agentScope: AgentScope,
+  agentSource: "user" | "project" | "unknown",
   usage: UsageStats,
 ): string {
   if (totalChildCount() >= MAX_TOTAL_CHILDREN) {
@@ -294,16 +382,17 @@ export function addToPool(
       `Max concurrent child processes reached (${MAX_TOTAL_CHILDREN}). Release or abort existing runs first.`,
     );
   }
-  const runId = `run_${crypto.randomUUID()}`;
+  const runId = `run_${randomUUID().slice(0, 8)}`;
   pool.set(runId, {
     runId,
     session,
     agent,
-    agentScope,
+    agentSource,
     createdAt: Date.now(),
     lastActivityAt: Date.now(),
     usage,
   });
+  scheduleIdleCleanup(runId);
   return runId;
 }
 
@@ -316,6 +405,15 @@ export function getFromPool(runId: string): PooledSession | undefined {
     return undefined;
   }
   return pooled;
+}
+
+export function updatePoolActivity(runId: string, usage: UsageStats): void {
+  const pooled = pool.get(runId);
+  if (pooled) {
+    pooled.lastActivityAt = Date.now();
+    pooled.usage = usage;
+    scheduleIdleCleanup(runId);
+  }
 }
 
 export function removeFromPool(runId: string): boolean {
@@ -338,20 +436,30 @@ export function registerExitHandlers(): void {
     releaseAll();
   });
 }
+
+function scheduleIdleCleanup(runId: string): void {
+  setTimeout(() => {
+    const pooled = pool.get(runId);
+    if (pooled && Date.now() - pooled.lastActivityAt >= POOL_IDLE_TIMEOUT_MS) {
+      pooled.session.killSync();
+      pool.delete(runId);
+    }
+  }, POOL_IDLE_TIMEOUT_MS);
+}
 ```
 
-- [ ] **Step 2: Update run-registry.ts to check pool size**
+- [ ] **Step 2: Update run-registry.ts to use shared limit**
+
+Replace the current `MAX_ACTIVE_RUNS` with imports from session-pool:
 
 ```ts
-// run-registry.ts — add import and update registerRun
-import { getPoolSize } from "./session-pool.ts";
+// run-registry.ts
+import type { AsyncRunInfo } from "./types.ts";
+import { totalChildCount, MAX_TOTAL_CHILDREN } from "./session-pool.ts";
 
-const MAX_TOTAL_CHILDREN = 8;
+const activeRuns = new Map<string, AsyncRunInfo>();
 
-function totalChildCount(): number {
-  return activeRuns.size + getPoolSize();
-}
-
+/** Register a new async run. Returns the run ID. Throws if max reached. */
 export function registerRun(info: AsyncRunInfo): string {
   if (totalChildCount() >= MAX_TOTAL_CHILDREN) {
     throw new Error(
@@ -363,17 +471,93 @@ export function registerRun(info: AsyncRunInfo): string {
 }
 ```
 
-Remove the old `MAX_ACTIVE_RUNS = 8` constant — replaced by shared `MAX_TOTAL_CHILDREN`.
+Remove old `MAX_ACTIVE_RUNS = 8` constant.
+
+Note: This creates `session-pool.ts` → `run-registry.ts` → `session-pool.ts` circular at module level. To break this, `session-pool.ts` imports `getActiveRunCount` from `run-registry.ts`, and `run-registry.ts` imports `totalChildCount` + `MAX_TOTAL_CHILDREN` from `session-pool.ts`. This IS circular at the module level.
+
+**Fix:** Make `totalChildCount` and `MAX_TOTAL_CHILDREN` not imported from session-pool. Instead, extract them to a shared `child-limit.ts`:
+
+```ts
+// child-limit.ts
+export const MAX_TOTAL_CHILDREN = 8;
+```
+
+Then both `session-pool.ts` and `run-registry.ts` import `MAX_TOTAL_CHILDREN` from `child-limit.ts`. `session-pool.ts` imports `getActiveRunCount` from `run-registry.ts` (unidirectional). `run-registry.ts` does NOT import from `session-pool.ts`.
+
+```ts
+// session-pool.ts
+import { getActiveRunCount } from "./run-registry.ts";
+import { MAX_TOTAL_CHILDREN } from "./child-limit.ts";
+
+export function totalChildCount(): number {
+  return pool.size + getActiveRunCount();
+}
+```
+
+```ts
+// run-registry.ts
+import { MAX_TOTAL_CHILDREN } from "./child-limit.ts";
+// Does NOT import from session-pool.ts
+
+export function registerRun(info: AsyncRunInfo): string {
+  // Can't check pool size directly — session-pool exports getPoolSize()
+  // But we can't import it without circular dep.
+  // Solution: run-registry checks against MAX_TOTAL_CHILDREN only for its own count.
+  // session-pool.addToPool() checks the combined count.
+  // This means run-registry could overshoot if pool is full.
+  // Fix: pass getPoolSize as a parameter, or accept the slight race.
+  if (activeRuns.size >= MAX_TOTAL_CHILDREN) {
+    throw new Error(...);
+  }
+  ...
+}
+```
+
+Actually this is getting complex. **Simplest correct solution:** `session-pool.ts` imports `getActiveRunCount` from `run-registry.ts`. `run-registry.ts` does NOT import from `session-pool.ts`. The pool checks the combined count before adding. The registry only checks its own count. This means the registry could allow up to 8 async runs even if the pool has sessions. But in practice, the pool is populated FROM completed runs (which are removed from registry), so the total never exceeds 8.
+
+```ts
+// run-registry.ts — no imports from session-pool
+import type { AsyncRunInfo } from "./types.ts";
+
+export const MAX_ACTIVE_RUNS = 8; // Registry-only limit
+const activeRuns = new Map<string, AsyncRunInfo>();
+
+export function registerRun(info: AsyncRunInfo): string {
+  if (activeRuns.size >= MAX_ACTIVE_RUNS) {
+    throw new Error(`Max concurrent async runs reached (${MAX_ACTIVE_RUNS}).`);
+  }
+  activeRuns.set(info.id, info);
+  return info.id;
+}
+```
+
+```ts
+// session-pool.ts — imports getActiveRunCount for combined check
+import { getActiveRunCount } from "./run-registry.ts";
+
+const MAX_TOTAL_CHILDREN = 8;
+
+function totalChildCount(): number {
+  return pool.size + getActiveRunCount();
+}
+
+function addToPool(...): string {
+  if (totalChildCount() >= MAX_TOTAL_CHILDREN) {
+    throw new Error(...);
+  }
+  ...
+}
+```
+
+This is correct: the pool gate is stricter (combined count), the registry gate is simpler (own count only). Since pool entries come from completed runs (removed from registry), total stays ≤ 8.
 
 - [ ] **Step 3: Write session-pool.test.ts**
-
-Test cases:
 
 ```ts
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   addToPool, getFromPool, removeFromPool, getPoolRunIds,
-  releaseAll, getPoolSize, registerExitHandlers,
+  releaseAll, getPoolSize,
 } from "./session-pool.ts";
 import type { RpcSession } from "./rpc-session.ts";
 
@@ -386,22 +570,24 @@ function mockSession(alive = true): RpcSession {
   } as unknown as RpcSession;
 }
 
+const emptyUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+
 describe("session-pool", () => {
   beforeEach(() => { releaseAll(); });
 
   it("add/get round-trip", () => {
     const s = mockSession();
-    const id = addToPool(s, "worker", "both", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
+    const id = addToPool(s, "worker", "user", emptyUsage);
     const pooled = getFromPool(id);
     expect(pooled).toBeDefined();
     expect(pooled!.runId).toBe(id);
     expect(pooled!.agent).toBe("worker");
+    expect(pooled!.agentSource).toBe("user");
   });
 
   it("get returns undefined for dead sessions (auto-removes)", () => {
     const s = mockSession(true);
-    const id = addToPool(s, "worker", "both", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
-    // Simulate death
+    const id = addToPool(s, "worker", "user", emptyUsage);
     (s as any).isAlive = () => false;
     const pooled = getFromPool(id);
     expect(pooled).toBeUndefined();
@@ -410,7 +596,7 @@ describe("session-pool", () => {
 
   it("remove", () => {
     const s = mockSession();
-    const id = addToPool(s, "worker", "both", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
+    const id = addToPool(s, "worker", "user", emptyUsage);
     expect(removeFromPool(id)).toBe(true);
     expect(getFromPool(id)).toBeUndefined();
   });
@@ -418,55 +604,69 @@ describe("session-pool", () => {
   it("releaseAll kills all sessions", () => {
     const s1 = mockSession();
     const s2 = mockSession();
-    addToPool(s1, "a", "both", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
-    addToPool(s2, "b", "both", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
+    addToPool(s1, "a", "user", emptyUsage);
+    addToPool(s2, "b", "user", emptyUsage);
     releaseAll();
     expect(getPoolSize()).toBe(0);
     expect(s1.killSync).toHaveBeenCalled();
     expect(s2.killSync).toHaveBeenCalled();
   });
 
-  it("enforces shared child process limit", () => {
-    // Fill up to MAX_TOTAL_CHILDREN (8)
-    for (let i = 0; i < 8; i++) {
-      addToPool(mockSession(), `agent${i}`, "both", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
-    }
-    expect(() => addToPool(mockSession(), "overflow", "both", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 })).toThrow(/Max concurrent/);
-  });
-
   it("getPoolRunIds returns all IDs", () => {
-    const id1 = addToPool(mockSession(), "a", "both", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
-    const id2 = addToPool(mockSession(), "b", "both", { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 });
+    const id1 = addToPool(mockSession(), "a", "user", emptyUsage);
+    const id2 = addToPool(mockSession(), "b", "user", emptyUsage);
     const ids = getPoolRunIds();
     expect(ids).toContain(id1);
     expect(ids).toContain(id2);
   });
+
+  it("updatePoolActivity updates timestamp and usage", () => {
+    const s = mockSession();
+    const id = addToPool(s, "worker", "user", emptyUsage);
+    const newUsage = { ...emptyUsage, input: 100, output: 50 };
+    updatePoolActivity(id, newUsage);
+    const pooled = getFromPool(id);
+    expect(pooled!.usage.input).toBe(100);
+  });
 });
 ```
 
-- [ ] **Step 4: Update run-registry.test.ts for shared limit**
-
-Update existing tests to account for pool size being checked. Since the pool starts empty in tests, existing tests should still pass.
-
-- [ ] **Step 5: Run tests**
+- [ ] **Step 4: Verify**
 
 Run: `npm run check`
 
 ### Task 3: action Parameter on Subagent Tool
 
 **Files:**
+- Modify: `C:\Code\DeepAgent\src\extension\types.ts` (add runId to SubagentDetails, add runId to SingleResult)
 - Modify: `C:\Code\DeepAgent\src\extension\tool.ts` (schema + execute handler)
 
-- [ ] **Step 1: Add action parameter to SubagentParams**
-
-Replace the current `SubagentParams` schema:
+- [ ] **Step 1: Add runId to SubagentDetails and SingleResult in types.ts**
 
 ```ts
-const ActionSchema = Type.Union([
-  Type.Literal("run", { description: "Run a new subagent task (default)" }),
-  Type.Literal("resume", { description: "Resume an idle session with a follow-up task" }),
-  Type.Literal("release", { description: "Release (destroy) an idle session" }),
-], { description: "Action to perform. Default: 'run'." });
+// In types.ts — SubagentDetails
+export interface SubagentDetails {
+  mode: "single" | "parallel" | "chain";
+  agentScope: AgentScope;
+  projectAgentsDir: string | null;
+  results: SingleResult[];
+  runId?: string; // present when keepAlive: true or action: "resume"
+}
+
+// In types.ts — SingleResult (add runId field)
+export interface SingleResult {
+  // ... existing fields ...
+  runId?: string; // present when session is pooled (keepAlive)
+}
+```
+
+- [ ] **Step 2: Add action + keepAlive parameters to SubagentParams (NO async param)**
+
+```ts
+const ActionSchema = StringEnum(["run", "resume", "release"] as const, {
+  description: "Action to perform. 'run': new task (default). 'resume': send follow-up to idle session. 'release': destroy idle session.",
+  default: "run",
+});
 
 const SubagentParams = Type.Object({
   action: Type.Optional(ActionSchema),
@@ -486,13 +686,14 @@ const SubagentParams = Type.Object({
     Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
   ),
   cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
-  async: Type.Optional(Type.Boolean({ description: "Run in background. Returns run ID immediately. Only for single mode.", default: false })),
 });
 ```
 
-- [ ] **Step 2: Add keepAlive param to runSingleAgent signature**
+Note: NO `async` parameter. Single mode is always fire-and-forget.
 
-Add `keepAlive: boolean = false` parameter to `runSingleAgent`:
+- [ ] **Step 3: Add keepAlive param to runSingleAgent**
+
+Add `keepAlive: boolean = false` as the last parameter:
 
 ```ts
 async function runSingleAgent(
@@ -505,149 +706,256 @@ async function runSingleAgent(
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
   makeDetails: (results: SingleResult[]) => SubagentDetails,
-  asyncMode: boolean = false,
+  fireAndForget: boolean = false,
   keepAlive: boolean = false,
-): Promise<SingleResult & { runId?: string }> {
+): Promise<SingleResult> {
 ```
 
-Return type changes to include optional `runId`.
+- [ ] **Step 4: Implement keepAlive in runSingleAgent**
 
-- [ ] **Step 3: Implement keepAlive in runSingleAgent**
+In the event listener (where `session.onEvent(...)` is wired), capture the unsubscribe and modify the auto-cleanup:
 
-After the `await session.stop()` section (line ~503), replace:
+Replace the current auto-cleanup:
 
 ```ts
-// Old:
-// Clean up
-await session.stop();
+// Current (line ~444-448):
+// Auto-cleanup after delay (unsub listeners + stop session)
+setTimeout(() => {
+  unsubEvents();
+  removeRun(runId);
+  session.stop().catch(() => {});
+}, 60_000);
+```
 
-// New:
-// Clean up or keep alive
-if (keepAlive && !wasAborted && currentResult.exitCode === 0) {
-  // Keep session alive — add to pool
-  const runId = addToPool(session, agentName, agent.agentScope ?? "both", currentResult.usage);
-  return { ...currentResult, runId };
-} else {
-  await session.stop();
+With:
+
+```ts
+// New: suppress auto-cleanup when keepAlive, move to pool on success
+let poolRunId: string | undefined;
+
+if (keepAlive && fireAndForget) {
+  // keepAlive doesn't make sense with fireAndForget — ignore
+  // (single mode already stays alive in run-registry)
+}
+
+if (!keepAlive || fireAndForget) {
+  // Standard auto-cleanup
+  setTimeout(() => {
+    unsubEvents();
+    removeRun(runId);
+    session.stop().catch(() => {});
+  }, 60_000);
+}
+// When keepAlive && !fireAndForget, cleanup happens in agent_end handler below
+```
+
+In the existing `onEvent` listener, after `if (event.type === "agent_end")`:
+
+```ts
+if (event.type === "agent_end") {
+  runInfo.status = "completed";
+
+  // keepAlive: move session from registry to pool
+  if (keepAlive && !fireAndForget && session.getExitCode() === null) {
+    unsubEvents();
+    removeRun(runId);
+    try {
+      poolRunId = addToPool(session, agentName, agent.source, runInfo.accumulated.usage);
+    } catch (err: any) {
+      // Pool full — fall through to normal cleanup
+      poolRunId = undefined;
+    }
+  }
 }
 ```
 
-Note: `keepAlive` must also skip `session.stop()` for error cases — only keep alive on success.
+After building the final result, add `runId`:
 
-- [ ] **Step 4: Wire action routing in execute handler**
+```ts
+const result: SingleResult = {
+  // ... existing fields ...
+  runId: poolRunId, // undefined unless keepAlive + pooled successfully
+};
+```
 
-In the `subagent` tool's `execute` method, add action routing before the existing logic:
+- [ ] **Step 5: Wire action routing in execute handler**
+
+At the top of the `execute` method, before existing logic:
 
 ```ts
 async execute(_toolCallId, params, signal, onUpdate, ctx) {
   const action = params.action ?? "run";
 
+  // Helper for simple results
+  const simpleResult = (text: string, isError = false) => ({
+    content: [{ type: "text" as const, text }],
+    details: undefined as SubagentDetails | undefined,
+    ...(isError ? { isError: true } : {}),
+  });
+
   // ── RELEASE action ──
   if (action === "release") {
-    if (!params.runId) return makeResult("runId is required for release action.", true);
+    if (!params.runId) return simpleResult("runId is required for release action.", true);
     const pooled = getFromPool(params.runId);
-    if (!pooled) return makeResult(`No active session with runId "${params.runId}". Available: ${getPoolRunIds().join(", ") || "none"}`, true);
-    await pooled.session.stop();
+    if (!pooled) return simpleResult(`No active session with runId "${params.runId}". Available: ${getPoolRunIds().join(", ") || "none"}`, true);
+    await pooled.session.stop().catch(() => {});
     removeFromPool(params.runId);
-    return makeResult(`Session ${params.runId} released.`);
+    return simpleResult(`Session ${params.runId} released.`);
   }
 
   // ── RESUME action ──
   if (action === "resume") {
-    if (!params.runId) return makeResult("runId is required for resume action.", true);
-    if (!params.task) return makeResult("task is required for resume action.", true);
+    if (!params.runId) return simpleResult("runId is required for resume action.", true);
+    if (!params.task) return simpleResult("task is required for resume action.", true);
     const pooled = getFromPool(params.runId);
-    if (!pooled) return makeResult(`No active session with runId "${params.runId}". Available: ${getPoolRunIds().join(", ") || "none"}`, true);
+    if (!pooled) return simpleResult(`No active session with runId "${params.runId}". Available: ${getPoolRunIds().join(", ") || "none"}`, true);
 
+    // Pool invariant: only sessions past agent_end are stored.
+    // followUp is safe because the agent inner loop has exited.
     pooled.lastActivityAt = Date.now();
 
-    // Collect resume events in a LOCAL array (don't clear pooled.events or any shared state)
-    const resumeEvents: RpcEvent[] = [];
+    // O(1) event accumulation
+    const accumulated: AccumulatedResult = {
+      messages: [],
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+      stderr: "",
+    };
 
     const currentResult: SingleResult = {
       agent: pooled.agent,
-      agentSource: "project", // pooled sessions are always from previous runs
+      agentSource: pooled.agentSource,
       task: params.task,
       exitCode: 0,
       messages: [],
       stderr: "",
       usage: { ...pooled.usage },
-      model: undefined,
     };
 
-    const makeDetails = ...; // same as existing
-
-    const emitUpdate = () => { ... };
-
-    // Wire event listener into LOCAL array
-    const unsubscribe = pooled.session.onEvent((event) => {
-      resumeEvents.push(event);
-      const partial = accumulateResultFromEvents(resumeEvents);
-      currentResult.messages = partial.messages;
-      currentResult.usage = partial.usage;
-      currentResult.model = partial.model;
-      currentResult.stopReason = partial.stopReason;
-      currentResult.errorMessage = partial.errorMessage;
-      emitUpdate();
+    const agentScope: AgentScope = params.agentScope ?? "user";
+    const makeResumeDetails = (results: SingleResult[]): SubagentDetails => ({
+      mode: "single",
+      agentScope,
+      projectAgentsDir: null,
+      results,
+      runId: pooled.runId,
     });
 
-    // Handle UI requests (same auto-respond pattern)
-    const uiUnsubscribe = pooled.session.onUIRequest(...);
+    const unsubResume = pooled.session.onEvent((event) => {
+      accumulateEvent(accumulated, event); // O(1)
+      if (onUpdate) {
+        onUpdate({
+          content: [{ type: "text", text: getFinalOutput(accumulated.messages) || "(running...)" }],
+          details: makeResumeDetails([{
+            ...currentResult,
+            messages: accumulated.messages,
+            usage: accumulated.usage,
+            model: accumulated.model,
+          }]),
+        });
+      }
+      if (event.type === "agent_end") {
+        currentResult.exitCode = pooled.session.getExitCode() ?? 0;
+      }
+    });
 
     // Send follow-up
     pooled.session.followUp(`Task: ${params.task}`);
 
-    // Wait for completion
+    // Wait for completion (blocking — same as chain/parallel)
     try {
       await pooled.session.waitForIdle(subagentConfig.idleTimeoutMs);
     } catch (err: any) {
       currentResult.exitCode = 1;
       currentResult.stderr = err.message;
     } finally {
-      unsubscribe();
-      uiUnsubscribe();
+      unsubResume();
     }
 
-    // Final accumulation from local events
-    const final = accumulateResultFromEvents(resumeEvents);
-    currentResult.messages = final.messages;
-    currentResult.usage = final.usage;
-    currentResult.model = final.model ?? currentResult.model;
-    currentResult.stopReason = final.stopReason ?? currentResult.stopReason;
-    currentResult.errorMessage = final.errorMessage ?? currentResult.errorMessage;
+    // Final result from accumulated
+    currentResult.messages = accumulated.messages;
+    currentResult.usage = accumulated.usage;
+    currentResult.model = accumulated.model ?? currentResult.model;
+    currentResult.stopReason = accumulated.stopReason ?? currentResult.stopReason;
+    currentResult.errorMessage = accumulated.errorMessage ?? currentResult.errorMessage;
 
-    // If keepAlive is still true (parent wants to keep it alive again), keep in pool
+    // If keepAlive, keep in pool for further follow-ups
     if (params.keepAlive && currentResult.exitCode === 0) {
-      pooled.lastActivityAt = Date.now();
-      pooled.usage = currentResult.usage;
-      return { ...currentResult, runId: pooled.runId };
+      updatePoolActivity(pooled.runId, currentResult.usage);
+      currentResult.runId = pooled.runId;
+      return {
+        content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(no output)" }],
+        details: makeResumeDetails([currentResult]),
+      };
     }
 
     // Otherwise, release the session
-    await pooled.session.stop();
+    await pooled.session.stop().catch(() => {});
     removeFromPool(pooled.runId);
-    return currentResult;
+    return {
+      content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(no output)" }],
+      details: makeResumeDetails([currentResult]),
+    };
   }
 
   // ── RUN action (default) ──
-  // ... existing run logic, but pass keepAlive to runSingleAgent ...
-}
+  // ... existing run logic (chain/parallel/single), pass keepAlive to runSingleAgent ...
 ```
 
-- [ ] **Step 5: Add runId to SubagentDetails**
+In the chain mode section, pass `keepAlive` on the last step only:
 
 ```ts
-// In types.ts
-export interface SubagentDetails {
-  mode: "single" | "parallel" | "chain";
-  agentScope: AgentScope;
-  projectAgentsDir: string | null;
-  results: SingleResult[];
-  runId?: string; // present when keepAlive: true or action: "resume"
+// Chain mode — only keep alive on the LAST step
+const isLastStep = i === params.chain.length - 1;
+const result = await runSingleAgent(
+  ctx.cwd, agents, step.agent, taskWithContext, step.cwd, i + 1,
+  signal, chainUpdate, makeDetails("chain"),
+  false, // fireAndForget — chain always waits
+  isLastStep && (params.keepAlive ?? false), // keepAlive only on last step
+);
+```
+
+In the parallel mode section, pass `keepAlive` is NOT supported (which step do we keep?). Document this:
+
+```ts
+// Parallel mode — keepAlive not supported (ambiguous which session to keep)
+// If user passes keepAlive with parallel, it's silently ignored.
+```
+
+In the single mode section, `keepAlive` is ignored (fire-and-forget already keeps session alive):
+
+```ts
+// Single mode — fire-and-forget, session stays in run-registry
+// keepAlive is not applicable (session already alive, parent polls via subagent_status)
+```
+
+- [ ] **Step 6: Update makeDetails closure to include runId**
+
+In the chain result, when `keepAlive` is true and the last result has `runId`:
+
+```ts
+// After building chain results:
+const lastResult = results[results.length - 1];
+return {
+  content: [{ type: "text", text: getFinalOutput(lastResult.messages) || "(no output)" }],
+  details: {
+    ...makeDetails("chain")(results),
+    runId: lastResult.runId,
+  },
+};
+```
+
+- [ ] **Step 7: Call registerExitHandlers() in extension init**
+
+After `subagentConfig = readSubagentConfig(process.cwd())` in the extension entry point:
+
+```ts
+if (process.env.SUBAGENT_CHILD !== "1") {
+  subagentConfig = readSubagentConfig(process.cwd());
+  registerExitHandlers();
 }
 ```
 
-- [ ] **Step 6: Verify**
+- [ ] **Step 8: Verify**
 
 Run: `npm run check`
 
@@ -658,24 +966,35 @@ Run: `npm run check`
 
 - [ ] **Step 1: Update renderResult for keepAlive sessions**
 
-When `details.runId` is present, append to the status line:
+In the single result rendering (expanded and collapsed), when `details.runId` is present, add:
 
 ```ts
-// In renderResult, after the turns/usage line, add:
+// After usage line:
 if (details.runId) {
-  lines.push(`  run: ${details.runId} (idle)`);
+  text += `\n${theme.fg("accent", `run: ${details.runId} (idle)`)}`;
 }
 ```
 
 - [ ] **Step 2: Update renderCall for action routing**
 
 ```ts
-// In renderCall:
+// In renderCall, at the top:
 if (args.action === "resume") {
-  return `subagent resume ${args.runId}\n  ${preview(args.task)}`;
+  const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+  let text =
+    theme.fg("toolTitle", theme.bold("subagent ")) +
+    theme.fg("accent", "resume") +
+    theme.fg("dim", ` ${args.runId}`);
+  text += `\n  ${theme.fg("dim", preview)}`;
+  return new Text(text, 0, 0);
 }
 if (args.action === "release") {
-  return `subagent release ${args.runId}`;
+  return new Text(
+    theme.fg("toolTitle", theme.bold("subagent ")) +
+    theme.fg("warning", "release") +
+    theme.fg("dim", ` ${args.runId}`),
+    0, 0,
+  );
 }
 // Default: existing rendering
 ```
@@ -691,24 +1010,29 @@ Run: `npm run check`
 
 - [ ] **Step 1: Add pool status to /doctor**
 
+Import `getPoolRunIds` and `getPoolSize` from `session-pool.ts`.
+
 ```ts
 const activeAsyncRuns = getActiveRunCount();
-const pooledSessions = getPoolRunIds();
-const totalChildren = activeAsyncRuns + pooledSessions.length;
+const pooledCount = getPoolSize();
+const pooledIds = getPoolRunIds();
+const totalChildren = activeAsyncRuns + pooledCount;
 
 const lines = [
   "Subagent Extension",
   "extension: loaded",
   `agents: ${agentList}`,
   "transport: rpc (--mode rpc)",
-  `child processes: ${totalChildren}/8 (async: ${activeAsyncRuns}, pooled: ${pooledSessions.length})`,
+  `child processes: ${totalChildren}/${MAX_TOTAL_CHILDREN} (async: ${activeAsyncRuns}, pooled: ${pooledCount})`,
   `config: idleTimeoutMs=${subagentConfig.idleTimeoutMs}`,
 ];
 
-if (pooledSessions.length > 0) {
-  lines.push(`pooled sessions: ${pooledSessions.join(", ")}`);
+if (pooledIds.length > 0) {
+  lines.push(`pooled sessions: ${pooledIds.join(", ")}`);
 }
 ```
+
+Import `MAX_TOTAL_CHILDREN` from `session-pool.ts` (via `child-limit.ts` if extracted, or directly).
 
 - [ ] **Step 2: Verify**
 
@@ -726,13 +1050,15 @@ Add guidance:
 
 ```markdown
 When a task benefits from context accumulation across multiple steps:
-1. Use `subagent` with `keepAlive: true` for the first step
+1. Use `subagent` with `keepAlive: true` (chain/parallel mode) for the first step
 2. Use `subagent` with `action: "resume"` and the returned `runId` for follow-up steps
 3. Use `subagent` with `action: "release"` and the `runId` when done to free resources
 
 For simple one-off tasks, omit `keepAlive` (default behavior: session destroyed after completion).
 
 When resuming, you can pass `keepAlive: true` again to keep the session alive for further follow-ups.
+
+Note: `keepAlive` works with chain and parallel modes. Single mode is always fire-and-forget — use `subagent_status` to poll results.
 ```
 
 - [ ] **Step 2: Update skill**
@@ -749,20 +1075,20 @@ npm run check
 
 Expected: all tests pass, 0 tsc errors.
 
-- [ ] **Step 2: Foreground single with keepAlive**
+- [ ] **Step 2: Chain with keepAlive**
 
 ```text
-Use subagent with agent "worker", agentScope "both", keepAlive true, to inspect the project entrypoints.
+Use subagent with chain mode, keepAlive true, to investigate the project.
 ```
 
 Expected:
-- result contains `runId`
+- result contains `runId` in details
 - `/doctor` shows pooled session
 
 - [ ] **Step 3: Resume follow-up**
 
 ```text
-Use subagent with action "resume", runId "<returned-id>", task "based on the inspection, list all exported functions".
+Use subagent with action "resume", runId "<returned-id>", task "based on the investigation, list all exported functions".
 ```
 
 Expected:
@@ -782,14 +1108,16 @@ Expected:
 
 ## Completion Criteria
 
-- `subagent` with `keepAlive: true` returns `runId` and keeps session alive
+- `subagent` with `keepAlive: true` (chain/parallel) returns `runId` and keeps session alive
 - `subagent` with `action: "resume"` sends follow-up task to idle session
 - `subagent` with `action: "release"` destroys idle session
-- Pool and registry share total child process limit of 8
+- Pool and registry share total child process limit (unidirectional imports)
 - `RpcSession.isAlive()` detects dead child processes
 - `RpcSession.killSync()` used in exit handler (sync)
-- Resume events collected in local array, not by clearing pooled state
-- Parent exit cleans up all sessions via sync `killSync()`
+- Resume events collected via `accumulateEvent()` (O(1))
+- Pool idle timeout (30 min safety net)
+- `registerExitHandlers()` called in extension init
+- `agentSource` preserved from original run in pooled session
 - `/doctor` reports child process count with breakdown
 - `npm run check` passes
 - Real Pi smoke confirms keepAlive → resume → release lifecycle
