@@ -47,17 +47,15 @@ export interface SingleResult {
   model?: string;
   stopReason?: string;
   errorMessage?: string;
-  step?: number;
-  runId?: string; // present when session is pooled (keepAlive)
+  runId?: string;
 }
 
-/** Details payload for the tool result (supports single/parallel/chain) */
+/** Details payload for the tool result */
 export interface SubagentDetails {
-  mode: "single" | "parallel" | "chain";
   agentScope: AgentScope;
   projectAgentsDir: string | null;
   results: SingleResult[];
-  runId?: string; // present when keepAlive: true or action: "resume"
+  runId?: string;
 }
 
 /** Agent discovery scope */
