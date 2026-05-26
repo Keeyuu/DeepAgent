@@ -256,10 +256,9 @@ const SubagentParams = Type.Object({
 });
 
 const ContactSupervisorParams = Type.Object({
-	type: Type.String({ description: "Type of communication: 'progress' for status updates, 'decision' for questions requiring parent input" }),
-	message: Type.String({ description: "The message to send to the parent/supervisor" }),
-	options: Type.Optional(Type.Array(Type.String(), { description: "Options for decision type (parent will choose one)" })),
-	default_value: Type.Optional(Type.String({ description: "Default value if parent doesn't respond" })),
+	type: Type.String({ description: "Type of communication: 'progress' for status updates, 'decision' for questions requiring supervisor's answer" }),
+	message: Type.String({ description: "The message to send to the supervisor" }),
+	options: Type.Optional(Type.Array(Type.String(), { description: "Available options for the supervisor to choose from (decision type only)" })),
 });
 
 // ── RPC-based agent runner ──────────────────────────────────────────────────
@@ -509,12 +508,11 @@ export default function (pi: ExtensionAPI) {
 		pi.registerTool({
 			name: "contact_supervisor",
 			label: "Contact Supervisor",
-			description: "Send a message to the parent agent (supervisor). Use 'progress' for status updates, 'decision' for questions that need parent input. The parent will see your message in the task results and may respond via a follow-up steer.",
+			description: "Communicate with your supervisor. 'progress' sends a status update (no response expected). 'decision' asks a question and waits for the supervisor's answer — you MUST wait for the response before continuing.",
 			parameters: ContactSupervisorParams,
 
 			async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<undefined>> {
 				if (params.type === "progress") {
-					// Progress update — returned as tool result text, visible to parent in output
 					return {
 						content: [{ type: "text", text: `[progress] ${params.message}` }],
 						details: undefined,
@@ -522,31 +520,20 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.type === "decision") {
-					// Decision request — use ctx.ui.input() as blocking transport.
-					// Triggers extension_ui_request via RPC → parent receives it.
-					// Async mode: parent stores pending decision → responds via subagent_respond → child unblocks.
-					// Sync mode: parent cancels immediately (it's blocked waiting for tool result and cannot decide).
 					const opts = params.options?.length ? `\nOptions: ${params.options.join(", ")}` : "";
-					const dv = params.default_value ? `\nDefault: ${params.default_value}` : "";
-					const prompt = `${params.message}${opts}${dv}`;
+					const prompt = `${params.message}${opts}`;
 
 					try {
 						const response = await ctx.ui.input("Supervisor Decision", prompt, { signal });
 						return {
-							content: [{ type: "text", text: response ?? params.default_value ?? "No response from supervisor." }],
+							content: [{ type: "text", text: response ?? "No response from supervisor." }],
 							details: undefined,
 						};
 					} catch {
-						// Cancelled by parent (sync mode cannot handle decisions) or timed out.
-						// Tell child LLM to decide on its own using available context.
-						if (params.default_value) {
-							return {
-								content: [{ type: "text", text: `Supervisor unavailable (sync mode). Using default: ${params.default_value}. Proceed with this value.` }],
-								details: undefined,
-							};
-						}
+						// Supervisor cannot respond (e.g. parent is blocked in sync mode).
+						// This is a hard stop — tell the LLM it must decide on its own.
 						return {
-							content: [{ type: "text", text: `Supervisor unavailable (sync mode). No default provided. Please make your best judgment based on available context and proceed.` }],
+							content: [{ type: "text", text: `Supervisor is unavailable for real-time decisions. You must make this decision yourself based on available context. Do not call contact_supervisor with type 'decision' again for this task.` }],
 							details: undefined,
 						};
 					}
