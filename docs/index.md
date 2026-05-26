@@ -2,6 +2,7 @@
 
 ## Architecture
 
+- [overview.html](architecture/overview.html) — Runtime architecture overview (visual HTML)
 - [dispatch.md](architecture/dispatch.md) — Unified subagent dispatch model (tasks[], async, keepAlive, session resume)
 
 ## Plans

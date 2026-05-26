@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepAgent Runtime Architecture</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #161822;
+    --surface2: #1c1f2e;
+    --border: #2a2d3e;
+    --text: #e0e0e8;
+    --text-dim: #8888a0;
+    --accent: #6c8cff;
+    --accent2: #4ecdc4;
+    --orange: #f9a825;
+    --red: #ff6b6b;
+    --green: #51cf66;
+    --purple: #b197fc;
+    --pink: #f783ac;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 2rem;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  h1 {
+    font-size: 2rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--text-dim); margin-bottom: 2rem; font-size: 0.95rem; }
+  h2 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    margin: 2.5rem 0 1rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin: 1.5rem 0 0.6rem;
+    color: var(--accent2);
+  }
+  p { margin: 0.5rem 0; }
+  code {
+    background: var(--surface2);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-size: 0.88em;
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    color: var(--pink);
+  }
+  pre {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    overflow-x: auto;
+    margin: 0.8rem 0;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; color: var(--text); }
+
+  /* Architecture diagram */
+  .diagram {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem;
+    margin: 1.5rem 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    overflow-x: auto;
+  }
+  .diagram-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 1.5rem;
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .box {
+    border-radius: 10px;
+    padding: 1rem 1.5rem;
+    text-align: center;
+    min-width: 160px;
+    position: relative;
+  }
+  .box-title {
+    font-weight: 700;
+    font-size: 0.95rem;
+    margin-bottom: 0.3rem;
+  }
+  .box-detail { font-size: 0.78rem; color: var(--text-dim); }
+  .box-parent {
+    background: linear-gradient(135deg, rgba(108,140,255,0.15), rgba(108,140,255,0.05));
+    border: 1.5px solid var(--accent);
+  }
+  .box-parent .box-title { color: var(--accent); }
+  .box-child {
+    background: linear-gradient(135deg, rgba(78,205,196,0.15), rgba(78,205,196,0.05));
+    border: 1.5px solid var(--accent2);
+  }
+  .box-child .box-title { color: var(--accent2); }
+  .box-tool {
+    background: linear-gradient(135deg, rgba(177,151,252,0.12), rgba(177,151,252,0.04));
+    border: 1px solid var(--purple);
+    min-width: 130px;
+    padding: 0.7rem 1rem;
+  }
+  .box-tool .box-title { color: var(--purple); font-size: 0.85rem; }
+  .box-infra {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    padding: 0.6rem 1rem;
+    min-width: 120px;
+  }
+  .box-infra .box-title { color: var(--orange); font-size: 0.85rem; }
+  .arrow-down {
+    font-size: 1.5rem;
+    color: var(--text-dim);
+    text-align: center;
+    padding: 0.3rem 0;
+    line-height: 1;
+  }
+  .arrow-label {
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    text-align: center;
+    margin-top: -0.2rem;
+  }
+  .channel-label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.25rem 0.6rem;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .ch-p2c { background: rgba(108,140,255,0.15); color: var(--accent); }
+  .ch-c2p { background: rgba(78,205,196,0.15); color: var(--accent2); }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.8rem 0;
+    font-size: 0.88rem;
+  }
+  th, td {
+    padding: 0.5rem 0.8rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    color: var(--text-dim);
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  td code { font-size: 0.82em; }
+
+  /* Badges */
+  .badge {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.15em 0.5em;
+    border-radius: 4px;
+    margin: 0 0.2em;
+    vertical-align: middle;
+  }
+  .badge-parent { background: rgba(108,140,255,0.2); color: var(--accent); }
+  .badge-child { background: rgba(78,205,196,0.2); color: var(--accent2); }
+  .badge-tool { background: rgba(177,151,252,0.2); color: var(--purple); }
+  .badge-cmd { background: rgba(249,168,37,0.2); color: var(--orange); }
+
+  /* Flow steps */
+  .flow {
+    margin: 1rem 0;
+    padding-left: 1.5rem;
+    border-left: 2px solid var(--border);
+  }
+  .flow-step {
+    position: relative;
+    padding: 0.4rem 0 0.4rem 1rem;
+    font-size: 0.9rem;
+  }
+  .flow-step::before {
+    content: '';
+    position: absolute;
+    left: -7px;
+    top: 0.85rem;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--surface2);
+    border: 2px solid var(--accent);
+  }
+  .flow-step.done::before { background: var(--accent); }
+  .flow-step-num {
+    font-weight: 700;
+    color: var(--accent);
+    margin-right: 0.3rem;
+  }
+
+  /* Grid */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin: 1rem 0;
+  }
+  @media (max-width: 768px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+  }
+  .card h4 {
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+  }
+
+  .tag {
+    display: inline-block;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1em 0.5em;
+    font-size: 0.78rem;
+    margin: 0.15rem;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+  }
+  .footer {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>DeepAgent Runtime Architecture</h1>
+<p class="subtitle">基于 Pi 官方 Extension API 的子 agent 委派系统 — 统一 dispatch、双向 RPC 通讯、会话复用</p>
+
+<!-- ============================================================ -->
+<h2>1. 系统总览</h2>
+
+<div class="diagram">
+  <!-- Parent Layer -->
+  <div class="box box-parent" style="width:80%;max-width:700px;">
+    <div class="box-title">Parent Pi Session</div>
+    <div class="box-detail">
+      <span class="badge badge-parent">subagent</span>
+      <span class="badge badge-parent">subagent_status</span>
+      <span class="badge badge-parent">subagent_steer</span>
+      <span class="badge badge-parent">subagent_respond</span>
+      <span class="badge badge-parent">subagent_abort</span>
+      <span class="badge badge-cmd">/doctor</span>
+    </div>
+  </div>
+
+  <div class="arrow-down">↓</div>
+  <div class="arrow-label">stdin JSONL (prompt / steer / follow_up / abort / extension_ui_response)</div>
+
+  <!-- Infra Layer -->
+  <div class="diagram-row" style="gap:0.8rem;">
+    <div class="box box-infra">
+      <div class="box-title">Run Registry</div>
+      <div class="box-detail">active runs map</div>
+    </div>
+    <div class="box box-infra">
+      <div class="box-title">Session Pool</div>
+      <div class="box-detail">keepAlive sessions</div>
+    </div>
+    <div class="box box-infra">
+      <div class="box-title">Event Accumulator</div>
+      <div class="box-detail">messages + usage</div>
+    </div>
+  </div>
+
+  <div class="arrow-down">↓ spawn</div>
+
+  <!-- Child Layer -->
+  <div class="diagram-row">
+    <div class="box box-child">
+      <div class="box-title">Child Pi Process</div>
+      <div class="box-detail">
+        <span class="badge badge-child">contact_supervisor</span><br>
+        <code>pi --mode rpc --no-session</code>
+      </div>
+    </div>
+    <div class="box box-child">
+      <div class="box-title">Child Pi Process</div>
+      <div class="box-detail">
+        <span class="badge badge-child">contact_supervisor</span><br>
+        <code>pi --mode rpc --no-session</code>
+      </div>
+    </div>
+    <div style="color:var(--text-dim);font-size:0.85rem;">…最多 8 个</div>
+  </div>
+
+  <div class="arrow-down">↑</div>
+  <div class="arrow-label">stdout JSONL (agent_start/end, message_*, tool_execution_*, extension_ui_request)</div>
+</div>
+
+<p>Parent 和每个 Child 之间通过 <strong>stdin/stdout JSONL</strong> 双向通讯。Parent 侧由 <code>RpcSession</code> 管理一个子进程的生命周期，所有子进程的运行状态由 <code>RunRegistry</code> 追踪，keepAlive 的空闲会话存入 <code>SessionPool</code>。</p>
+
+<!-- ============================================================ -->
+<h2>2. Extension 注册 — 双模式</h2>
+
+<p>Extension 入口 <code>src/extension/tool.ts</code> 根据 <code>SUBAGENT_CHILD</code> 环境变量分两个模式：</p>
+
+<div class="grid-2">
+  <div class="card">
+    <h4 style="color:var(--accent);">Parent 模式 <code style="font-size:0.8rem;">SUBAGENT_CHILD !== "1"</code></h4>
+    <p>注册 <strong>5 个工具 + 1 个命令</strong>：</p>
+    <table>
+      <tr><th>工具</th><th>用途</th></tr>
+      <tr><td><code>subagent</code></td><td>统一 dispatch：RUN / RESUME / RELEASE</td></tr>
+      <tr><td><code>subagent_status</code></td><td>查询运行状态 / 列出所有 runs</td></tr>
+      <tr><td><code>subagent_steer</code></td><td>运行中注入转向指令</td></tr>
+      <tr><td><code>subagent_respond</code></td><td>回复 child 的 pending decision</td></tr>
+      <tr><td><code>subagent_abort</code></td><td>终止运行中的 child</td></tr>
+    </table>
+    <p>命令：<code>/doctor</code> — 诊断，显示已发现 agents、活跃/池化数量、配置。</p>
+    <p>初始化时加载 <code>.pi/settings.json</code> 配置，注册 exit handler 释放所有子进程。</p>
+  </div>
+  <div class="card">
+    <h4 style="color:var(--accent2);">Child 模式 <code style="font-size:0.8rem;">SUBAGENT_CHILD === "1"</code></h4>
+    <p>注册 <strong>仅 1 个工具</strong>：</p>
+    <table>
+      <tr><th>工具</th><th>用途</th></tr>
+      <tr><td><code>contact_supervisor</code></td><td>Child → Parent 通讯</td></tr>
+    </table>
+    <p>两种类型：</p>
+    <ul style="margin-left:1.2rem;font-size:0.9rem;">
+      <li><strong>progress</strong> — 即时返回，不阻塞，parent 无需响应</li>
+      <li><strong>decision</strong> — 阻塞等待 parent 通过 <code>subagent_respond</code> 回复</li>
+    </ul>
+    <p>无 config 加载、无 pool、无 monitoring 工具。返回后 child 立即退出。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. 统一 Dispatch 流程</h2>
+
+<h3>3.1 RUN Action（默认）</h3>
+
+<div class="flow">
+  <div class="flow-step"><span class="flow-step-num">1.</span> <code>tasks: [{agent, task, cwd?}]</code> 传入</div>
+  <div class="flow-step"><span class="flow-step-num">2.</span> <code>discoverAgents(cwd, scope)</code> 发现可用 agents</div>
+  <div class="flow-step"><span class="flow-step-num">3.</span> 校验 tasks 非空、≤ 8 个</div>
+  <div class="flow-step"><span class="flow-step-num">4.</span> Project agent 确认（scope 含 project 时弹出 UI 确认）</div>
+  <div class="flow-step"><span class="flow-step-num">5.</span> 容量检查：<code>active + pool + tasks.length ≤ 8</code></div>
+  <div class="flow-step"><span class="flow-step-num">6.</span> <code>mapWithConcurrencyLimit(tasks, 4, launchAgent)</code></div>
+  <div class="flow-step"><span class="flow-step-num">7.</span> 返回 run ID 列表（async）或完整结果（sync）</div>
+</div>
+
+<h3>3.2 launchAgent（fire-and-forget）</h3>
+
+<pre><code>async function launchAgent(defaultCwd, agents, agentName, task, cwd, signal, keepAlive?)
+  → 解析 AgentConfig（找不到则返回错误 SingleResult）
+  → new RpcSession({ cwd, env: { SUBAGENT_CHILD: "1", SUBAGENT_DEPTH: depth+1 }, ... })
+  → await session.start()                           // spawn + 等待 agent_start
+  → 创建 AsyncRunInfo { id: UUID, status: "running" }
+  → 注册 onEvent / onUIRequest / onClose listeners
+  → registerRun(runInfo)                            // 加入 activeRuns Map
+  → session.prompt("Task: " + task)                 // 发送初始 JSONL
+  → return { exitCode: -1, errorMessage: "Run ID: ..." }</code></pre>
+
+<p><strong>事件处理：</strong></p>
+<table>
+  <tr><th>事件</th><th>处理</th></tr>
+  <tr><td><code>agent_end</code></td><td>keepAlive? → <code>addToPool()</code> : → 60s 后自动清理</td></tr>
+  <tr><td><code>extension_ui_request</code></td><td>过滤 fire-and-forget 方法，其余设为 <code>pendingDecision</code></td></tr>
+  <tr><td>进程意外关闭</td><td>标记 failed/completed，5s 后清理</td></tr>
+  <tr><td>AbortSignal</td><td>状态 → aborted，调用 <code>session.abort()</code></td></tr>
+</table>
+
+<h3>3.3 RESUME Action</h3>
+
+<div class="flow">
+  <div class="flow-step"><span class="flow-step-num">1.</span> <code>getFromPool(runId)</code> 取出 keepAlive 的 session</div>
+  <div class="flow-step"><span class="flow-step-num">2.</span> 创建新 AccumulatedResult，注册临时 AsyncRunInfo</div>
+  <div class="flow-step"><span class="flow-step-num">3.</span> <code>session.followUp("Task: " + task)</code></div>
+  <div class="flow-step"><span class="flow-step-num">4.</span> <code>await session.waitForIdle(timeout)</code> 阻塞等待</div>
+  <div class="flow-step"><span class="flow-step-num">5.</span> keepAlive? → 留在 pool : → stop + removeFromPool</div>
+</div>
+
+<h3>3.4 RELEASE Action</h3>
+<p><code>session.stop()</code>（SIGTERM → 5s → SIGKILL）+ <code>removeFromPool(runId)</code></p>
+
+<!-- ============================================================ -->
+<h2>4. RPC 通讯协议</h2>
+
+<p>Child 进程以 <code>pi --mode rpc --no-session</code> 启动，Parent 通过 <strong>stdin/stdout JSONL</strong> 与之通讯。</p>
+
+<h3>4.1 Parent → Child（stdin JSONL）</h3>
+<table>
+  <tr><th>类型</th><th>JSONL 格式</th><th>触发方式</th></tr>
+  <tr>
+    <td><code>prompt</code></td>
+    <td><code>{"type":"prompt","message":"..."}</code></td>
+    <td><code>session.prompt()</code></td>
+  </tr>
+  <tr>
+    <td><code>steer</code></td>
+    <td><code>{"type":"steer","message":"..."}</code></td>
+    <td><code>session.steer()</code> ← <code>subagent_steer</code></td>
+  </tr>
+  <tr>
+    <td><code>follow_up</code></td>
+    <td><code>{"type":"follow_up","message":"..."}</code></td>
+    <td><code>session.followUp()</code> ← RESUME action</td>
+  </tr>
+  <tr>
+    <td><code>abort</code></td>
+    <td><code>{"type":"abort"}</code></td>
+    <td><code>session.abort()</code></td>
+  </tr>
+  <tr>
+    <td><code>extension_ui_response</code></td>
+    <td><code>{"type":"extension_ui_response","id":"...","value":"..."}</code></td>
+    <td><code>session.respondToUIRequest()</code> ← <code>subagent_respond</code></td>
+  </tr>
+</table>
+
+<h3>4.2 Child → Parent（stdout JSONL 事件）</h3>
+<table>
+  <tr><th>分类</th><th>事件类型</th><th>说明</th></tr>
+  <tr><td rowspan="2"><strong>生命周期</strong></td><td><code>agent_start</code></td><td>Child agent 启动</td></tr>
+  <tr><td><code>agent_end</code></td><td>Child agent 完成（含 messages）</td></tr>
+  <tr><td rowspan="3"><strong>消息流</strong></td><td><code>message_start</code></td><td>LLM 回复开始</td></tr>
+  <tr><td><code>message_update</code></td><td>流式 delta</td></tr>
+  <tr><td><code>message_end</code></td><td>LLM 回复结束（含 usage）</td></tr>
+  <tr><td rowspan="3"><strong>工具执行</strong></td><td><code>tool_execution_start</code></td><td>工具调用开始</td></tr>
+  <tr><td><code>tool_execution_update</code></td><td>工具执行进度</td></tr>
+  <tr><td><code>tool_execution_end</code></td><td>工具调用结果</td></tr>
+  <tr><td><strong>UI 请求</strong></td><td><code>extension_ui_request</code></td><td>child 的 <code>ctx.ui.*</code> 调用</td></tr>
+  <tr><td><strong>响应</strong></td><td><code>response</code></td><td>命令确认</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>5. 双向通讯详解</h2>
+
+<div class="grid-2">
+  <div class="card">
+    <h4 style="color:var(--accent);">Parent → Child</h4>
+    <table>
+      <tr><th>方法</th><th>RpcSession API</th><th>用途</th></tr>
+      <tr><td>初始任务</td><td><code>prompt(msg)</code></td><td>RUN dispatch</td></tr>
+      <tr><td>中途转向</td><td><code>steer(msg)</code></td><td>修改行为方向</td></tr>
+      <tr><td>后续任务</td><td><code>followUp(msg)</code></td><td>RESUME 复用</td></tr>
+      <tr><td>终止</td><td><code>abort()</code></td><td>优雅中止</td></tr>
+      <tr><td>回复决策</td><td><code>respondToUIRequest(id, val)</code></td><td>回答 decision 请求</td></tr>
+    </table>
+  </div>
+  <div class="card">
+    <h4 style="color:var(--accent2);">Child → Parent</h4>
+    <p>通过 <code>contact_supervisor</code> 工具：</p>
+    <table>
+      <tr><th>type</th><th>行为</th></tr>
+      <tr>
+        <td><code>progress</code></td>
+        <td>即时返回 <code>[progress] msg</code>，不阻塞，parent 无需响应</td>
+      </tr>
+      <tr>
+        <td><code>decision</code></td>
+        <td>调用 <code>ctx.ui.input()</code> → 发出 <code>extension_ui_request</code> → <strong>阻塞等待</strong> parent 回复</td>
+      </tr>
+    </table>
+    <p style="margin-top:0.5rem;">Parent 通过 <code>subagent_status</code> 看到 <code>pendingDecision</code>，用 <code>subagent_respond</code> 回复。超时或取消则 child 返回 <code>{ terminate: true }</code>。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. 会话池 &amp; 生命周期</h2>
+
+<div class="diagram" style="padding:1.5rem;">
+  <div class="diagram-row">
+    <div class="box box-parent" style="min-width:140px;">
+      <div class="box-title">RUN</div>
+      <div class="box-detail">launchAgent()</div>
+    </div>
+    <div style="color:var(--text-dim);font-size:1.2rem;">→</div>
+    <div class="box box-child">
+      <div class="box-title">Running</div>
+      <div class="box-detail">RunRegistry</div>
+    </div>
+    <div style="color:var(--text-dim);font-size:1.2rem;">→ agent_end</div>
+  </div>
+  <div class="diagram-row" style="margin-top:0.8rem;">
+    <div style="flex:1;"></div>
+    <div style="display:flex;flex-direction:column;align-items:center;">
+      <div style="color:var(--green);font-size:0.85rem;font-weight:600;">keepAlive=true</div>
+      <div class="arrow-down">↓</div>
+      <div class="box box-infra" style="border-color:var(--green);">
+        <div class="box-title" style="color:var(--green);">Idle Pool</div>
+        <div class="box-detail">SessionPool</div>
+      </div>
+      <div class="arrow-down">↓ ↑</div>
+      <div style="display:flex;gap:0.8rem;">
+        <div class="box box-parent" style="min-width:100px;padding:0.5rem 0.8rem;">
+          <div class="box-title" style="font-size:0.8rem;">RESUME</div>
+        </div>
+        <div class="box" style="min-width:100px;padding:0.5rem 0.8rem;background:rgba(255,107,107,0.1);border:1px solid var(--red);">
+          <div class="box-title" style="font-size:0.8rem;color:var(--red);">RELEASE</div>
+        </div>
+      </div>
+    </div>
+    <div style="flex:1;display:flex;flex-direction:column;align-items:center;">
+      <div style="color:var(--red);font-size:0.85rem;font-weight:600;">keepAlive=false</div>
+      <div class="arrow-down">↓</div>
+      <div style="font-size:0.85rem;color:var(--text-dim);">60s 自动清理<br>session.stop()</div>
+    </div>
+  </div>
+</div>
+
+<p>Pool 空闲超时 30 分钟自动回收。进程退出时 <code>releaseAll()</code> 同步清理所有池化 session。</p>
+
+<!-- ============================================================ -->
+<h2>7. 容量限制</h2>
+
+<table>
+  <tr><th>常量</th><th>值</th><th>含义</th></tr>
+  <tr><td><code>MAX_PARALLEL_TASKS</code></td><td>8</td><td>单次 dispatch 最多 tasks 数</td></tr>
+  <tr><td><code>MAX_CONCURRENCY</code></td><td>4</td><td>并行启动上限</td></tr>
+  <tr><td><code>MAX_TOTAL_CHILDREN</code></td><td>8</td><td>运行中 + 池化总数上限</td></tr>
+  <tr><td><code>MAX_ACTIVE_RUNS</code></td><td>8</td><td>同时 running 的 run 数上限</td></tr>
+  <tr><td>启动超时</td><td>2s</td><td>等待 child 首个事件</td></tr>
+  <tr><td>非 keepAlive 清理</td><td>60s</td><td>agent_end 后延迟清理</td></tr>
+  <tr><td>进程崩溃清理</td><td>5s</td><td>意外关闭后延迟清理</td></tr>
+  <tr><td>SIGKILL 回退</td><td>5s</td><td>SIGTERM 后强制 kill</td></tr>
+  <tr><td>Pool 空闲回收</td><td>30 min</td><td>池化 session 最大空闲时间</td></tr>
+  <tr><td>waitForIdle 默认超时</td><td>5 min</td><td>RESUME 阻塞等待上限</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>8. Agent 发现</h2>
+
+<p><code>discoverAgents(cwd, scope)</code> 按范围查找 agent 定义文件（<code>*.md</code> YAML frontmatter）：</p>
+
+<table>
+  <tr><th>Scope</th><th>User 目录</th><th>Project 目录</th><th>冲突策略</th></tr>
+  <tr><td><code>"user"</code>（默认）</td><td><code>~/.pi/agent/agents/*.md</code></td><td>—</td><td>—</td></tr>
+  <tr><td><code>"project"</code></td><td>—</td><td>向上遍历找 <code>.pi/agents/</code></td><td>—</td></tr>
+  <tr><td><code>"both"</code></td><td>✓</td><td>✓</td><td>Project 覆盖同名 User agent</td></tr>
+</table>
+
+<p>Agent 文件格式：</p>
+<pre><code>---
+name: worker
+description: Bounded task execution
+tools: read, grep, find, ls, bash, edit, write, contact_supervisor
+model: optional-override
+---
+System prompt body...</code></pre>
+
+<!-- ============================================================ -->
+<h2>9. 安全防护</h2>
+
+<div class="grid-2">
+  <div class="card">
+    <h4 style="color:var(--red);">路径拦截</h4>
+    <ul style="margin-left:1.2rem;font-size:0.88rem;">
+      <li><code>auth.json</code>（任何路径下）</li>
+      <li><code>.env</code>、<code>.env.*</code></li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4 style="color:var(--red);">命令拦截</h4>
+    <ul style="margin-left:1.2rem;font-size:0.88rem;">
+      <li><code>git reset --hard</code></li>
+      <li><code>git clean</code></li>
+      <li><code>rm -rf</code></li>
+      <li><code>rd /s /q</code></li>
+      <li><code>Remove-Item -Recurse -Force</code></li>
+    </ul>
+  </div>
+</div>
+<p>嵌套限制：<code>SUBAGENT_CHILD=1</code> 或 <code>SUBAGENT_DEPTH ≥ 1</code> 时禁止再创建子 agent。</p>
+<p style="font-size:0.85rem;color:var(--text-dim);">注：<code>guards.ts</code> 已定义但尚未接入 <code>tool.ts</code> 执行管线。</p>
+
+<!-- ============================================================ -->
+<h2>10. 关键文件索引</h2>
+
+<table>
+  <tr><th>文件</th><th>职责</th></tr>
+  <tr><td><code>src/extension/tool.ts</code></td><td>Extension 注册、dispatch 逻辑、renderCall/renderResult、contact_supervisor</td></tr>
+  <tr><td><code>src/extension/types.ts</code></td><td>共享类型：SingleResult, SubagentDetails, AsyncRunInfo, UsageStats</td></tr>
+  <tr><td><code>src/extension/rpc-session.ts</code></td><td>RPC session 生命周期（spawn, prompt, steer, abort, waitForIdle）</td></tr>
+  <tr><td><code>src/extension/run-registry.ts</code></td><td>活跃 run 追踪和状态查询</td></tr>
+  <tr><td><code>src/extension/session-pool.ts</code></td><td>KeepAlive 空闲 session 池</td></tr>
+  <tr><td><code>src/extension/event-accumulator.ts</code></td><td>RPC event → result 累积（纯函数）</td></tr>
+  <tr><td><code>src/extension/agents.ts</code></td><td>Agent 发现（user + project scope）</td></tr>
+  <tr><td><code>src/extension/guards.ts</code></td><td>安全拦截（路径/命令/嵌套）</td></tr>
+  <tr><td><code>.pi/settings.json</code></td><td>Extension / prompt / skill 注册</td></tr>
+  <tr><td><code>.pi/agents/worker.md</code></td><td>Worker agent 配置</td></tr>
+  <tr><td><code>.pi/prompts/parent.md</code></td><td>Parent session system prompt</td></tr>
+  <tr><td><code>.pi/skills/subagent/SKILL.md</code></td><td>Subagent 工作流 skill</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<h2>11. 顺序工作流（替代 chain）</h2>
+
+<p>V1 没有 chain 模式。顺序执行由 parent 自行多次调用实现，更灵活：</p>
+
+<pre><code>// Step 1: 研究
+subagent({ tasks: [{agent:"worker", task:"analyze coverage"}], async: false })
+// → parent 看到结果，决定下一步
+
+// Step 2: 执行
+subagent({ tasks: [{agent:"worker", task:"fix uncovered areas based on: &lt;result&gt;"}], async: false })
+// → parent 验证，完成</code></pre>
+
+<p>优势：parent 可以根据中间结果修改下一步、跳过步骤、切换 agent、或提前中止。</p>
+
+<div class="footer">
+  DeepAgent Runtime Architecture · 基于 Pi 官方 Extension API · 2026-05-27
+</div>
+
+</body>
+</html>
