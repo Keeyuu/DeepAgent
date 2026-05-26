@@ -1,23 +1,44 @@
 ---
 name: subagent
-description: Official-Pi-only child delegation workflow with session resume.
+description: Delegate tasks to isolated child Pi processes with session resume support.
 ---
 
 # Subagent Workflow
 
 Use this workflow when a task should be delegated to an isolated child Pi process.
 
-## Modes
+## Dispatch
 
-1. **Single** (`agent` + `task`) — Fire-and-forget: returns run ID immediately. Poll with `subagent_status`.
-2. **Parallel** (`tasks` array) — Runs tasks concurrently, waits for all to complete.
-3. **Chain** (`chain` array) — Runs steps sequentially, `{previous}` placeholder for prior output.
+```
+subagent({ tasks: [{ agent: "worker", task: "..." }] })
+```
 
-## Session Resume (chain only)
+- `async: true` (default) — Returns run IDs immediately. Poll with `subagent_status`.
+- `async: false` — Blocks until all tasks complete, returns full results.
+- `keepAlive: true` — Keeps child sessions alive for follow-up.
 
-Set `keepAlive: true` on chain mode to keep the child session alive after completion.
+Multiple tasks run in parallel:
+```
+subagent({ tasks: [
+  { agent: "worker", task: "task A" },
+  { agent: "worker", task: "task B" },
+] })
+```
+
+## Session Resume
+
+Set `keepAlive: true` to keep the child session alive after completion.
 - Later: `action: "resume"` with `runId` + `task` to continue the session.
 - Done: `action: "release"` with `runId` to free the child process.
+
+## Sequential Workflows
+
+For multi-step tasks, make sequential `subagent` calls. The parent sees each result and decides whether to continue:
+```
+subagent({ tasks: [{ agent: "researcher", task: "investigate X" }], async: false })
+// → see result, decide next step
+subagent({ tasks: [{ agent: "coder", task: "implement based on: <result>" }], async: false })
+```
 
 ## Monitoring
 
