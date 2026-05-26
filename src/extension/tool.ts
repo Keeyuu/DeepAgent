@@ -391,6 +391,13 @@ async function runSingleAgent(
 					// Pool full — fall through to normal cleanup
 					poolRunId = undefined;
 				}
+			} else if (fireAndForget) {
+				// Fire-and-forget: auto-cleanup 60s after completion
+				setTimeout(() => {
+					unsubEvents();
+					removeRun(runId);
+					session.stop().catch(() => {});
+				}, 60_000);
 			}
 		}
 	});
@@ -412,6 +419,7 @@ async function runSingleAgent(
 	if (signal) {
 		const killSession = async () => {
 			runInfo.status = "aborted";
+			unsubEvents();
 			try { session.abort(); } catch { /* ignore */ }
 			setTimeout(() => {
 				removeRun(runId);
@@ -710,28 +718,54 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// ── Chain mode: launch all steps as independent async runs ──
+			// ── Chain mode: sequential execution with {previous} substitution ──
 			if (params.chain && params.chain.length > 0) {
 				const results: SingleResult[] = [];
+				let previousOutput = "";
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
 					const isLastStep = i === params.chain.length - 1;
-					// {previous} is left as-is; chain orchestration (sequential deps) is a future phase
+					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+
+					const chainUpdate: OnUpdateCallback | undefined = onUpdate && isLastStep
+						? (partial) => {
+								const currentResult = partial.details?.results[0];
+								if (currentResult) {
+									const allResults = [...results, currentResult];
+									onUpdate({
+										content: partial.content,
+										details: makeDetails("chain")(allResults),
+									});
+								}
+							}
+						: undefined;
+
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
 						step.agent,
-						step.task,
+						taskWithContext,
 						step.cwd,
 						i + 1,
 						signal,
-						isLastStep ? onUpdate : undefined,
+						chainUpdate,
 						isLastStep ? makeDetails("chain") : undefined,
 						false, // fireAndForget
 						isLastStep && (params.keepAlive ?? false), // keepAlive only on last step
 					);
 					results.push(result);
+
+					const isError = isFailedResult(result);
+					if (isError) {
+						const errorMsg = getResultOutput(result);
+						return {
+							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+							details: { ...makeDetails("chain")(results), runId: undefined },
+							isError: true,
+						};
+					}
+					previousOutput = getFinalOutput(result.messages);
 				}
 
 				const lastResult = results[results.length - 1];
