@@ -9,6 +9,7 @@
  * When SUBAGENT_CHILD=1, registers only contact_supervisor (not subagent).
  */
 
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
@@ -37,6 +38,36 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const DEFAULT_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
+
+// ── Config ─────────────────────────────────────────────────────────────────
+
+/** Read subagent config from .pi/settings.json */
+function readSubagentConfig(cwd: string): { idleTimeoutMs: number } {
+	try {
+		// Walk up to find .pi/settings.json
+		let dir = cwd;
+		for (let i = 0; i < 20; i++) {
+			const settingsPath = path.join(dir, ".pi", "settings.json");
+			if (fs.existsSync(settingsPath)) {
+				const raw = fs.readFileSync(settingsPath, "utf-8");
+				const settings = JSON.parse(raw);
+				return {
+					idleTimeoutMs: settings.subagentIdleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
+				};
+			}
+			const parent = path.dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
+		}
+	} catch {
+		// Ignore — use defaults
+	}
+	return { idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS };
+}
+
+/** Module-level config, populated on extension init */
+let subagentConfig = { idleTimeoutMs: DEFAULT_IDLE_TIMEOUT_MS };
 
 // ── Formatting helpers ─────────────────────────────────────────────────────
 
@@ -356,9 +387,9 @@ async function runSingleAgent(
 	// Send the task as a prompt
 	session.prompt(`Task: ${task}`);
 
-	// Wait for agent to finish (idle heartbeat: 5 min with no event = stuck)
+	// Wait for agent to finish (idle heartbeat, configurable via subagentIdleTimeoutMs)
 	try {
-		await session.waitForIdle(300_000);
+		await session.waitForIdle(subagentConfig.idleTimeoutMs);
 	} catch (err: any) {
 		// Idle timeout — child stopped producing events
 		currentResult.exitCode = 1;
@@ -393,6 +424,12 @@ async function runSingleAgent(
 // ── Extension entry point ──────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	// Load config from .pi/settings.json (parent mode only)
+	if (process.env.SUBAGENT_CHILD !== "1") {
+		// pi.cwd is available via the API but not typed — use process.cwd() fallback
+		subagentConfig = readSubagentConfig(process.cwd());
+	}
+
 	// ── CHILD MODE: register contact_supervisor only ──
 	if (process.env.SUBAGENT_CHILD === "1") {
 		pi.registerTool({
