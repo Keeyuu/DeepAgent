@@ -93,3 +93,30 @@ export type RpcEvent =
   | { type: "tool_execution_end"; toolCallId?: string; toolName?: string; result?: string; isError?: boolean }
   | { type: "extension_ui_request"; id: string; method: string; [key: string]: unknown }
   | { type: string; [key: string]: unknown }; // fallback for unknown events
+
+/** Status of an async subagent run */
+export type RunStatus = "running" | "completed" | "failed" | "aborted";
+
+/** Info tracked for each async subagent run */
+export interface AsyncRunInfo {
+  /** Unique run ID */
+  id: string;
+  /** Agent name */
+  agent: string;
+  /** Original task */
+  task: string;
+  /** Current status */
+  status: RunStatus;
+  /** Live RPC session (typed as unknown to avoid circular imports with rpc-session.ts) */
+  session: unknown;
+  /** Accumulated events from the session */
+  events: RpcEvent[];
+  /** Accumulated result (updated on each event) */
+  accumulated: AccumulatedResult;
+  /** Start timestamp */
+  startedAt: number;
+  /** Last error message (if failed) */
+  lastError?: string;
+  /** Agent source (user/project) */
+  agentSource: "user" | "project" | "unknown";
+}
