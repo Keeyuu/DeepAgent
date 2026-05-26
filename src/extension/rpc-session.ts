@@ -446,6 +446,19 @@ export class RpcSession {
     return this.started;
   }
 
+  /** Check if the child process is still running */
+  isAlive(): boolean {
+    return this.proc !== null && !this.proc.killed && this.exitCode === null;
+  }
+
+  /** Synchronous kill for process.on('exit'). No async cleanup. */
+  killSync(): void {
+    if (this.proc && !this.proc.killed) {
+      try { this.proc.kill(); } catch { /* already dead */ }
+    }
+    this.cleanupTempFiles();
+  }
+
   /** Clean up temp prompt files */
   private cleanupTempFiles(): void {
     if (this.tmpPromptPath) {
