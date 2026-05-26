@@ -522,11 +522,10 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.type === "decision") {
-					// Decision request — use ctx.ui.input() as transport layer.
-					// This triggers extension_ui_request via RPC → parent receives it.
-					// Parent responds via extension_ui_response → child unblocks.
-					// In sync mode, parent auto-replies with default value.
-					// In async mode, parent LLM decides and responds via subagent_respond tool.
+					// Decision request — use ctx.ui.input() as blocking transport.
+					// Triggers extension_ui_request via RPC → parent receives it.
+					// Async mode: parent stores pending decision → responds via subagent_respond → child unblocks.
+					// Sync mode: parent cancels immediately (it's blocked waiting for tool result and cannot decide).
 					const opts = params.options?.length ? `\nOptions: ${params.options.join(", ")}` : "";
 					const dv = params.default_value ? `\nDefault: ${params.default_value}` : "";
 					const prompt = `${params.message}${opts}${dv}`;
@@ -537,11 +536,17 @@ export default function (pi: ExtensionAPI) {
 							content: [{ type: "text", text: response ?? params.default_value ?? "No response from supervisor." }],
 							details: undefined,
 						};
-					} catch (err: unknown) {
-						// Cancelled or timed out — use default value
-						const fallback = params.default_value ?? "No response (request cancelled).";
+					} catch {
+						// Cancelled by parent (sync mode cannot handle decisions) or timed out.
+						// Tell child LLM to decide on its own using available context.
+						if (params.default_value) {
+							return {
+								content: [{ type: "text", text: `Supervisor unavailable (sync mode). Using default: ${params.default_value}. Proceed with this value.` }],
+								details: undefined,
+							};
+						}
 						return {
-							content: [{ type: "text", text: `[decision-cancelled] ${fallback}` }],
+							content: [{ type: "text", text: `Supervisor unavailable (sync mode). No default provided. Please make your best judgment based on available context and proceed.` }],
 							details: undefined,
 						};
 					}
