@@ -601,15 +601,21 @@ export default function (pi: ExtensionAPI) {
 				};
 				registerRun(resumeRunInfo);
 
-				// Wire onUIRequest so contact_supervisor(decision) works during resume
+				// Wire onUIRequest — forward to parent user to avoid deadlock
+				// (parent blocked on waitForIdle, can't call subagent_respond)
 				pooled.session.onUIRequest((req) => {
 					const fireAndForgetMethods = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
 					if (fireAndForgetMethods.includes(req.method)) return;
-					resumeRunInfo.pendingDecision = {
-						requestId: req.id,
-						message: (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request",
-						requestedAt: Date.now(),
-					};
+					const message = (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request";
+					if (ctx?.hasUI) {
+						ctx.ui.input("Child Decision", message).then((response) => {
+							pooled.session.respondToUIRequest(req.id, { value: response ?? "" });
+						}).catch(() => {
+							pooled.session.respondToUIRequest(req.id, { cancelled: true });
+						});
+					} else {
+						resumeRunInfo.pendingDecision = { requestId: req.id, message, requestedAt: Date.now() };
+					}
 				});
 
 				if (!pooled.session.isAlive()) {
