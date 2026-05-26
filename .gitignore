@@ -145,5 +145,8 @@ vite.config.ts.timestamp-*
 # Codegraph local DB
 .codegraph/
 
+# Deepwork session state
+.slim/deepwork/
+
 # Windows artifacts
 nul
