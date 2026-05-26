@@ -11,7 +11,8 @@ const activeRuns = new Map<string, AsyncRunInfo>();
 
 /** Register a new async run. Returns the run ID. Throws if max reached. */
 export function registerRun(info: AsyncRunInfo): string {
-  if (activeRuns.size >= MAX_ACTIVE_RUNS) {
+  const runningCount = Array.from(activeRuns.values()).filter(r => r.status === "running").length;
+  if (runningCount >= MAX_ACTIVE_RUNS) {
     throw new Error(
       `Max concurrent async runs reached (${MAX_ACTIVE_RUNS}). Abort an existing run first.`,
     );
@@ -32,9 +33,9 @@ export function removeRun(id: string): AsyncRunInfo | undefined {
   return info;
 }
 
-/** Get count of active runs */
+/** Get count of active runs (running only, excludes completed/failed/aborted awaiting cleanup) */
 export function getActiveRunCount(): number {
-  return activeRuns.size;
+  return Array.from(activeRuns.values()).filter(r => r.status === "running").length;
 }
 
 /** Get all active runs as array */
