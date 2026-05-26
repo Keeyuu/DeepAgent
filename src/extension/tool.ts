@@ -42,6 +42,7 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const EXIT_CODE_PENDING = -1; // Signals a run is still in progress
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
 
 // ── Config ─────────────────────────────────────────────────────────────────
@@ -196,11 +197,16 @@ function truncateParallelOutput(output: string): string {
 	const byteLength = Buffer.byteLength(output, "utf8");
 	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
 
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
+	// Truncate by byte boundary to avoid breaking UTF-8 surrogate pairs.
+	// Start from PER_TASK_OUTPUT_CAP and walk back to a valid UTF-8 boundary.
+	const buf = Buffer.from(output, "utf8");
+	let end = PER_TASK_OUTPUT_CAP;
+	// If we cut in the middle of a multi-byte sequence, back up.
+	// A valid UTF-8 continuation byte is 0x80–0xBF (starts with 10xxxxxx).
+	while (end > 0 && (buf[end] & 0xC0) === 0x80) end--;
+	const truncated = buf.subarray(0, end).toString("utf8");
+	const omittedBytes = byteLength - end;
+	return `${truncated}\n\n[Output truncated: ${omittedBytes} bytes omitted. Full output preserved in tool details.]`;
 }
 
 async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -211,7 +217,7 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	if (items.length === 0) return [];
 	const limit = Math.max(1, Math.min(concurrency, items.length));
 	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
+	let nextIndex = 0; // Safe: JS is single-threaded, no real race on ++
 	const workers = new Array(limit).fill(null).map(async () => {
 		while (true) {
 			const current = nextIndex++;
@@ -344,7 +350,7 @@ async function runSingleAgent(
 	};
 
 	// Wire up event accumulation + streaming updates
-	session.onEvent((event) => {
+	const unsubEvents = session.onEvent((event) => {
 		runInfo.events.push(event);
 		accumulateEvent(runInfo.accumulated, event);
 
@@ -356,7 +362,7 @@ async function runSingleAgent(
 					agent: agentName,
 					agentSource: agent.source,
 					task,
-					exitCode: -1,
+					exitCode: EXIT_CODE_PENDING,
 					messages: runInfo.accumulated.messages,
 					stderr: "",
 					usage: runInfo.accumulated.usage,
@@ -374,6 +380,7 @@ async function runSingleAgent(
 	// Framework UI requests from child.
 	// contact_supervisor(decision) uses ctx.ui.input() → triggers extension_ui_request.
 	// Store as pending decision so parent LLM can respond via subagent_respond.
+	// No timeout: parent agent decides when to respond (may need time to gather info).
 	session.onUIRequest((req) => {
 		const fireAndForgetMethods = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
 		if (fireAndForgetMethods.includes(req.method)) return;
@@ -407,7 +414,7 @@ async function runSingleAgent(
 			agent: agentName,
 			agentSource: agent.source,
 			task,
-			exitCode: -1,
+			exitCode: EXIT_CODE_PENDING,
 			messages: [],
 			stderr: "",
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
@@ -440,8 +447,9 @@ async function runSingleAgent(
 		step,
 	};
 
-	// Auto-cleanup after delay
+	// Auto-cleanup after delay (unsub listeners + stop session)
 	setTimeout(() => {
+		unsubEvents();
 		removeRun(runId);
 		session.stop().catch(() => {});
 	}, 60_000);
@@ -652,7 +660,7 @@ export default function (pi: ExtensionAPI) {
 						agent: params.tasks[i].agent,
 						agentSource: "unknown",
 						task: params.tasks[i].task,
-						exitCode: -1,
+						exitCode: EXIT_CODE_PENDING,
 						messages: [],
 						stderr: "",
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
@@ -661,8 +669,8 @@ export default function (pi: ExtensionAPI) {
 
 				const emitParallelUpdate = () => {
 					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
+						const running = allResults.filter((r) => r.exitCode === EXIT_CODE_PENDING).length;
+						const done = allResults.filter((r) => r.exitCode !== EXIT_CODE_PENDING).length;
 						onUpdate({
 							content: [
 								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
@@ -961,9 +969,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (details.mode === "parallel") {
-				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-				const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
+				const running = details.results.filter((r) => r.exitCode === EXIT_CODE_PENDING).length;
+				const successCount = details.results.filter((r) => r.exitCode !== EXIT_CODE_PENDING && !isFailedResult(r)).length;
+				const failCount = details.results.filter((r) => r.exitCode !== EXIT_CODE_PENDING && isFailedResult(r)).length;
 				const isRunning = running > 0;
 				const icon = isRunning
 					? theme.fg("warning", "⏳")
@@ -1027,7 +1035,7 @@ export default function (pi: ExtensionAPI) {
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
 				for (const r of details.results) {
 					const rIcon =
-						r.exitCode === -1
+						r.exitCode === EXIT_CODE_PENDING
 							? theme.fg("warning", "⏳")
 							: isFailedResult(r)
 								? theme.fg("error", "✗")
@@ -1035,7 +1043,7 @@ export default function (pi: ExtensionAPI) {
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
 					if (displayItems.length === 0)
-						text += `\n${theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)")}`;
+						text += `\n${theme.fg("muted", r.exitCode === EXIT_CODE_PENDING ? "(running...)" : "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
 				if (!isRunning) {

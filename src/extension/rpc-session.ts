@@ -44,12 +44,14 @@ export interface ExtensionUIRequest {
 
 type EventListener = (event: RpcEvent) => void;
 type UIRequestListener = (request: ExtensionUIRequest) => void;
+type CloseListener = (code: number) => void;
 
 export class RpcSession {
   private proc: ChildProcess | null = null;
   private rl: ReturnType<typeof createInterface> | null = null;
   private listeners: EventListener[] = [];
   private uiListeners: UIRequestListener[] = [];
+  private closeListeners: CloseListener[] = [];
   private stderr = "";
   private exitCode: number | null = null;
   private started = false;
@@ -194,10 +196,15 @@ export class RpcSession {
       this.proc.on("close", (code) => {
         this.exitCode = code ?? 0;
         this.rl?.close();
+        // Notify close listeners (e.g. waitForIdle) so they don't hang
+        for (const listener of this.closeListeners) {
+          listener(this.exitCode!);
+        }
       });
 
       this.proc.on("error", (err) => {
         this.startError = err.message;
+        clearTimeout(startupTimeout);
         reject(err);
       });
 
@@ -205,6 +212,21 @@ export class RpcSession {
       this.rl = createInterface({ input: this.proc.stdout! });
 
       let settled = false;
+      const startupTimeout = setTimeout(() => {
+        if (!settled) {
+          if (this.exitCode !== null) {
+            settled = true;
+            reject(new Error(`RPC process exited before startup with code ${this.exitCode}: ${this.stderr}`));
+            return;
+          }
+          // If still running but no event, resolve anyway — the process is alive
+          if (this.proc && !this.proc.killed && this.exitCode === null) {
+            this.started = true;
+            settled = true;
+            resolve();
+          }
+        }
+      }, 2000);
 
       this.rl.on("line", (line: string) => {
         if (!line.trim()) return;
@@ -237,36 +259,20 @@ export class RpcSession {
           if (event.type === "agent_start" || event.type === "response") {
             this.started = true;
             settled = true;
+            clearTimeout(startupTimeout);
             resolve();
           }
         }
       });
-
-      // Timeout: if process exits before first event, reject
-      const startupTimeout = setTimeout(() => {
-        if (!settled) {
-          if (this.exitCode !== null) {
-            settled = true;
-            reject(new Error(`RPC process exited before startup with code ${this.exitCode}: ${this.stderr}`));
-          }
-          // If still running but no event, resolve anyway — the process is alive
-          if (this.proc && !this.proc.killed && this.exitCode === null) {
-            this.started = true;
-            settled = true;
-            resolve();
-          }
-        }
-      }, 2000);
-
-      // Clean up timeout on resolution
-      const cleanup = () => clearTimeout(startupTimeout);
-      const origResolve = resolve;
-      const wrappedResolve = () => { cleanup(); origResolve(); };
-      // Already wrapped above in the line handler, just clean up on reject too
-      reject = ((origReject: (reason: any) => void) => {
-        return (reason: any) => { cleanup(); origReject(reason); };
-      })(reject);
     });
+  }
+
+  /** Subscribe to process close events. Returns unsubscribe function. */
+  onClose(listener: CloseListener): () => void {
+    this.closeListeners.push(listener);
+    return () => {
+      this.closeListeners = this.closeListeners.filter((l) => l !== listener);
+    };
   }
 
   /** Subscribe to agent events. Returns unsubscribe function. */
@@ -332,28 +338,48 @@ export class RpcSession {
     return new Promise((resolve, reject) => {
       const events: RpcEvent[] = [];
       let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+
+      const done = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
 
       const resetIdleTimer = () => {
         if (idleTimer) clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
-          cleanup();
-          reject(new Error(`Session idle for ${idleTimeoutMs}ms — no events received from child process`));
+          done(() => {
+            unsubEvent();
+            unsubClose();
+            reject(new Error(`Session idle for ${idleTimeoutMs}ms — no events received from child process`));
+          });
         }, idleTimeoutMs);
       };
 
-      const unsubscribe = this.onEvent((event) => {
+      const unsubEvent = this.onEvent((event) => {
         events.push(event);
         resetIdleTimer();
         if (event.type === "agent_end") {
-          cleanup();
-          resolve(events);
+          done(() => {
+            unsubClose();
+            if (idleTimer) clearTimeout(idleTimer);
+            resolve(events);
+          });
         }
       });
 
-      const cleanup = () => {
-        unsubscribe();
-        if (idleTimer) clearTimeout(idleTimer);
-      };
+      // If process dies before agent_end, resolve immediately with what we have
+      const unsubClose = this.onClose((code) => {
+        done(() => {
+          if (idleTimer) clearTimeout(idleTimer);
+          if (code === 0) {
+            resolve(events);
+          } else {
+            reject(new Error(`RPC process exited with code ${code}: ${this.stderr}`));
+          }
+        });
+      });
 
       // Start idle timer
       resetIdleTimer();
