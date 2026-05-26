@@ -8,7 +8,7 @@ DeepAgent gives your Pi session the ability to delegate tasks to isolated child 
 
 ```
 parent Pi session
-  → subagent tool (single / parallel / chain)
+  → subagent tool (tasks[])
   → child pi --mode rpc
   → worker agent
   → structured result
@@ -20,7 +20,7 @@ The parent stays clean. Each child has its own context window, project-specific 
 
 ```powershell
 npm install
-npm run check        # TypeScript + 50 unit tests
+npm run check        # TypeScript + 76 unit tests
 pi                   # start Pi from project root
 ```
 
@@ -29,14 +29,19 @@ Inside Pi:
 ```
 /doctor              # check extension status, list available agents
 
-# Single task
-Use subagent with agent "worker" to list project files. Do not edit anything.
+# Single task (async by default)
+Use subagent with tasks [{"agent":"worker","task":"List project files. Do not edit anything."}]
 
 # Parallel tasks
 Use subagent with tasks [{"agent":"worker","task":"Check tests"},{"agent":"worker","task":"Check types"}]
 
-# Chain (sequential with {previous} substitution)
-Use subagent with chain [{"agent":"worker","task":"Find all test files"},{"agent":"worker","task":"Review {previous} for coverage gaps"}]
+# Sync (blocking)
+Use subagent with tasks [{"agent":"worker","task":"Find all test files"}] async false
+
+# Sequential workflow (parent decides next step after each result)
+Use subagent with tasks [{"agent":"worker","task":"Analyze coverage"}] async false
+# → see result, then:
+Use subagent with tasks [{"agent":"worker","task":"Fix uncovered areas based on: <result>"}] async false
 ```
 
 ## Architecture
@@ -50,7 +55,8 @@ Built on official Pi capabilities:
 - `AgentToolResult`, renderCall/renderResult from official subagent demo
 
 Key additions over the official demo:
-- **RPC transport**: replaces `--mode json` fire-and-forget spawn with `--mode rpc` session (allows steer/followUp/abort)
+- **Unified dispatch**: single `tasks[]` array with `async` boolean — no separate single/parallel/chain modes
+- **Session resume**: `keepAlive` keeps child alive for follow-up via `action: "resume"`
 - **contact_supervisor tool**: child can send progress updates and decision requests to parent via `ctx.ui.confirm/input/notify`
 - **Windows compatibility**: resolves `pi` CLI path for `shell:false` spawn
 
@@ -84,45 +90,64 @@ src/
     agents.ts              # Agent discovery (user + project scope)
     event-accumulator.ts   # Pure functions for RPC event accumulation
     rpc-session.ts         # RPC session manager (--mode rpc spawn)
+    run-registry.ts        # Active run tracking and status queries
+    session-pool.ts        # Idle session pool for keepAlive/resume
     guards.ts              # Safety guards (blocked paths/commands)
-    tool.ts                # Extension registration (subagent tool + contact_supervisor + /doctor)
+    tool.ts                # Extension registration (subagent tool + monitoring tools + /doctor)
     *.test.ts              # Unit tests
 scripts/
   smoke-rpc.ts             # Integration smoke test
+  smoke-async.ts           # Async mode smoke test
+  smoke-resume.ts          # Session resume smoke test
 ```
 
-## Modes
+## Dispatch Model
 
-### Single
+All tasks use a unified `tasks[]` array. No separate modes.
 
-```json
-{ "agent": "worker", "task": "List all TypeScript files in src/" }
-```
+### Parameters
 
-### Parallel
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `tasks` | `Array<{agent, task, cwd?}>` | — | Tasks to dispatch (action=run) |
+| `async` | `boolean` | `true` | Return run IDs immediately (true) or block until complete (false) |
+| `keepAlive` | `boolean` | `false` | Keep child sessions alive for later resume |
+| `action` | `"run"\|"resume"\|"release"` | `"run"` | Run new tasks, resume a session, or release it |
+| `runId` | `string` | — | Session ID for resume/release |
+| `agentScope` | `"user"\|"project"\|"both"` | `"user"` | Which agent directories to search |
 
-Up to 8 tasks, 4 concurrent. Each capped at 50KB output.
+### Async Mode (default)
 
-```json
-{
-  "tasks": [
-    { "agent": "worker", "task": "Check test coverage" },
-    { "agent": "worker", "task": "Find TODO comments" }
-  ]
-}
-```
-
-### Chain
-
-Sequential execution. `{previous}` substituted with prior step output.
+Returns immediately with run IDs. Poll with `subagent_status`.
 
 ```json
 {
-  "chain": [
-    { "agent": "worker", "task": "Find all test files" },
-    { "agent": "worker", "task": "Review {previous} for gaps" }
-  ]
+  "tasks": [{"agent": "worker", "task": "Check test coverage"}]
 }
+```
+
+### Sync Mode
+
+Blocks until all tasks complete. Parent sees full results.
+
+```json
+{
+  "tasks": [{"agent": "worker", "task": "Check test coverage"}],
+  "async": false
+}
+```
+
+### Session Resume
+
+```json
+// Launch with keepAlive
+{ "tasks": [{"agent": "worker", "task": "Analyze codebase"}], "keepAlive": true }
+
+// Resume later
+{ "action": "resume", "runId": "...", "task": "Now fix the issues you found" }
+
+// Release when done
+{ "action": "release", "runId": "..." }
 ```
 
 ## Agent Scope
@@ -157,6 +182,13 @@ Environment: `SUBAGENT_CHILD=1`, `SUBAGENT_DEPTH=<parent+1>`
 
 Child extensions that call `ctx.ui.confirm/input/select` emit `extension_ui_request` on stdout. The parent auto-responds (confirm=true, input="", select=first option). Fire-and-forget methods (notify, setStatus, setTitle) require no response.
 
+## Monitoring Tools
+
+- **subagent_status** — Check run progress or list all active runs. Shows pending decisions.
+- **subagent_steer** — Send a mid-run steering message to redirect an agent.
+- **subagent_respond** — Answer a pending decision from a child (contact_supervisor).
+- **subagent_abort** — Abort a running subagent immediately.
+
 ## Safety
 
 The extension blocks:
@@ -171,29 +203,31 @@ When `SUBAGENT_CHILD=1`, the extension registers `contact_supervisor` instead of
 ## Tests
 
 ```powershell
-npm run test        # 50 unit tests
+npm run test        # 76 unit tests
 npm run typecheck   # TypeScript type check
 npm run check       # Both
-npx tsx scripts/smoke-rpc.ts   # Integration smoke test (requires Pi + model access)
+npx tsx scripts/smoke-rpc.ts      # Integration smoke test (requires Pi + model access)
+npx tsx scripts/smoke-async.ts    # Async mode smoke test
+npx tsx scripts/smoke-resume.ts   # Session resume smoke test
 ```
 
 ## Validation Record
 
-2026-05-26 Phase 2 smoke tests:
+2026-05-27 Unified dispatch:
 
 | # | Test | Result |
 |---|------|--------|
-| 1 | Unit tests | Passed: 50 tests |
+| 1 | Unit tests | Passed: 76 tests |
 | 2 | TypeScript check | Passed: 0 errors |
 | 3 | Agent discovery | Passed: worker agent found (project scope) |
 | 4 | RPC session startup | Passed: session started, handshake completed |
-| 5 | Single task (list files) | Passed: child used ls tool, returned structured output |
-| 6 | Event accumulation | Passed: 363 events, 6 messages, usage tracked |
-| 7 | Process cleanup | Passed: exit code 0, no stderr |
+| 5 | Unified tasks[] dispatch | Passed: async/sync paths, parallel tasks |
+| 6 | Session resume | Passed: keepAlive + resume + release |
+| 7 | Event accumulation | Passed: usage tracked, messages captured |
+| 8 | Process cleanup | Passed: exit code 0, no stderr |
 
 ## Future Work
 
-- Async mode: `subagent_async` + `subagent_status` + `subagent_abort` tools
-- Steer/followUp from parent agent
 - `scout` agent for read-only exploration
-- Review loops
+- Review loops (auto-resume for iterative refinement)
+- Capacity-aware scheduling across multiple agent types

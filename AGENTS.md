@@ -1,29 +1,16 @@
 # DeepAgent Project Instructions
 
 - 默认中文沟通，简洁、直接、证据优先。
-- 当前实施路线只走一条：全量迁移 `earendil-works/pi` 官方 subagent demo，再在官方方案上补父子 agent 双向通讯。
-- 官方实现基线：
-  - https://pi.dev/docs/latest
-  - https://pi.dev/docs/latest/extensions
-  - https://pi.dev/docs/latest/settings
-  - https://pi.dev/docs/latest/prompt-templates
-  - https://pi.dev/docs/latest/skills
-  - https://pi.dev/docs/latest/rpc
-  - https://pi.dev/docs/latest/json
+- 基于 `earendil-works/pi` 官方 extension API 构建 subagent 系统。
+- 官方参考：
+  - https://pi.dev/docs/latest (+ /extensions, /settings, /prompt-templates, /skills, /rpc, /json)
   - https://github.com/earendil-works/pi
-  - `C:\Code\pi-learn\pi` (`/c/Code/pi-learn/pi`)
-  - `C:\Code\pi-learn\pi\packages\coding-agent\examples\extensions\subagent`
-- 非官方参考只允许借鉴，不作为 V1 依赖或运行时：
-  - `C:\Code\pi-learn\pi-subagents`
-  - `C:\Code\pi-learn\oh-my-pi`
-  - `C:\Code\pi-learn\oh-my-opencode-slim`
-  - `C:\Code\pi-learn\opencode-dynamic-context-pruning`
-- 不从头扩展 minimal runner；官方 demo 的 single、parallel、chain、agentScope、onUpdate、details、renderCall/renderResult、usage/tool-call capture、abort handling 都应作为基线保留。
-- 父子通讯传输层优先使用官方 `--mode rpc` / `RpcClient` / RPC extension UI protocol；不要设计 `.deepagent/runs/*` 文件系统 inbox/outbox 或 `run-store.ts`。
-- 现阶段不做 DeepAgent project-only policy 或额外安全 hardening；先把官方 demo 全量迁移和父子通讯跑通。
-- `pi-intercom`、`pi-subagents` 等社区实现只作通讯语义和协议参考，不作为当前 runtime 依赖。
-- 项目装配优先使用 `.pi/settings.json`、`.pi/prompts/`、`.pi/skills/`、`.pi/extensions/` 和官方 extension API。
-- 命名规范：工具、命令、目录、prompt、skill、env var 使用语义名；不要加无意义 `deepagent` / `DeepAgent` 前缀。只有项目名、package name、README 标题这类对象本身是 DeepAgent 时才使用。示例：tool `subagent`，extension `subagent`，skill `subagent`，diagnostic command `/doctor`，env `SUBAGENT_CHILD`。
-- 父子通讯目标：child 可用 `contact_supervisor` 汇报进度/请求决策；parent 可通过控制通道向 live child 注入 steer/follow-up 指令改变方向。
+  - 本地 clone: `C:\Code\pi-learn\pi`
+  - 官方 subagent example: `packages/coding-agent/examples/extensions/subagent`
+- 非官方仓库（`pi-subagents`, `oh-my-pi`, `oh-my-opencode-slim`, `opencode-dynamic-context-pruning`）只允许借鉴，不作为 runtime 依赖。
+- 传输层使用官方 `--mode rpc` / `RpcClient` / RPC extension UI protocol。
+- 项目装配使用 `.pi/settings.json`、`.pi/prompts/`、`.pi/skills/`、`.pi/extensions/`。
+- 命名规范：工具、命令、目录、prompt、skill、env var 使用语义名，不加 `deepagent` / `DeepAgent` 前缀。示例：tool `subagent`，extension `subagent`，skill `subagent`，diagnostic command `/doctor`，env `SUBAGENT_CHILD`。
+- 子 agent 可用 `contact_supervisor` 汇报进度/请求决策；parent 可通过 steer/follow-up 控制运行中的 child。
 - 不读取、打印或修改 `C:\Users\Goni\.pi\agent\auth.json`。
-- 修改保持小范围；不要迁移无关配置，不做无关重构。
+- 修改保持小范围；不做无关重构。
