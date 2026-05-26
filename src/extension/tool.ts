@@ -239,7 +239,6 @@ const SubagentParams = Type.Object({
 	runId: Type.Optional(Type.String({ description: "Session runId for resume/release actions" })),
 	task: Type.Optional(Type.String({ description: "Task for resume action" })),
 	keepAlive: Type.Optional(Type.Boolean({ description: "Keep session alive after resume completion (for action='resume'). Default: false.", default: false })),
-	confirmProjectAgents: Type.Optional(Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true })),
 });
 
 const ContactSupervisorParams = Type.Object({
@@ -637,27 +636,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Project agent confirmation
-			if ((agentScope === "project" || agentScope === "both") && (params.confirmProjectAgents ?? true) && ctx.hasUI) {
-				const requestedAgentNames = new Set(tasks.map((t) => t.agent));
-				const projectAgentsRequested = Array.from(requestedAgentNames)
-					.map((name) => agents.find((a) => a.name === name))
-					.filter((a): a is AgentConfig => a?.source === "project");
 
-				if (projectAgentsRequested.length > 0) {
-					const names = projectAgentsRequested.map((a) => a.name).join(", ");
-					const dir = discovery.projectAgentsDir ?? "(unknown)";
-					const ok = await ctx.ui.confirm(
-						"Run project-local agents?",
-						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
-					);
-					if (!ok)
-						return {
-							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
-							details: { agentScope, projectAgentsDir: discovery.projectAgentsDir, results: [] },
-						};
-				}
-			}
 
 			// Capacity check
 			const currentTotal = getActiveRunCount() + getPoolSize();

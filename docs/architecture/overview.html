@@ -375,10 +375,9 @@
   <div class="flow-step"><span class="flow-step-num">1.</span> <code>tasks: [{agent, task, cwd?}]</code> 传入</div>
   <div class="flow-step"><span class="flow-step-num">2.</span> <code>discoverAgents(cwd, scope)</code> 发现可用 agents</div>
   <div class="flow-step"><span class="flow-step-num">3.</span> 校验 tasks 非空、≤ 8 个</div>
-  <div class="flow-step"><span class="flow-step-num">4.</span> Project agent 确认（scope 含 project 时弹出 UI 确认）</div>
-  <div class="flow-step"><span class="flow-step-num">5.</span> 容量检查：<code>active + pool + tasks.length ≤ 8</code></div>
-  <div class="flow-step"><span class="flow-step-num">6.</span> <code>mapWithConcurrencyLimit(tasks, 4, launchAgent)</code></div>
-  <div class="flow-step"><span class="flow-step-num">7.</span> 返回 run ID 列表（async）或完整结果（sync）</div>
+  <div class="flow-step"><span class="flow-step-num">4.</span> 容量检查：<code>active + pool + tasks.length ≤ 8</code></div>
+  <div class="flow-step"><span class="flow-step-num">5.</span> <code>mapWithConcurrencyLimit(tasks, 4, launchAgent)</code></div>
+  <div class="flow-step"><span class="flow-step-num">6.</span> 返回 run ID 列表（async）或完整结果（sync）</div>
 </div>
 
 <h3>3.2 launchAgent（fire-and-forget）</h3>
