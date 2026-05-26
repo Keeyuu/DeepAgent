@@ -227,8 +227,8 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	default: "user",
 });
 
-const ActionSchema = StringEnum(["run", "resume", "release"] as const, {
-	description: "Action to perform. 'run': new task(s) (default). 'resume': send follow-up to idle session. 'release': destroy idle session.",
+const ActionSchema = StringEnum(["run", "resume", "release", "follow_up", "steer"] as const, {
+	description: "Action: 'run' (default) = new tasks. 'resume' = restart idle session with prompt(). 'release' = destroy session. 'follow_up' = queue message on running session. 'steer' = interrupt running session.",
 	default: "run",
 });
 
@@ -475,11 +475,12 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
-			"Provide a 'tasks' array of {agent, task} to dispatch.",
-			"async=true (default): returns run IDs immediately. Use subagent_status to track progress and get results.",
-			"Use keepAlive to keep sessions alive for follow-up via action='resume'.",
-			'Default agent scope is "user" (from ~/.pi/agent/agents).',
-			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
+			"action='run': provide tasks[] to launch. Returns run IDs immediately. Use subagent_status to track.",
+			"action='resume': restart idle session (keepAlive) with prompt(). Requires runId + task.",
+			"action='release': destroy idle session. Requires runId.",
+			"action='steer': interrupt running session with message. Requires runId + task.",
+			"action='follow_up': queue message on running session (non-interrupting). Requires runId + task.",
+			"Use keepAlive on tasks to keep sessions alive for resume.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -503,7 +504,39 @@ export default function (pi: ExtensionAPI) {
 				return simpleResult(`Session ${params.runId} released.`);
 			}
 
-			// ── RESUME action ──
+			// ── FOLLOW_UP action (queue message on running session) ──
+			if (action === "follow_up") {
+				if (!params.runId) return simpleResult("runId is required for follow_up action.", true);
+				if (!params.task) return simpleResult("task is required for follow_up action.", true);
+				const run = getRun(params.runId);
+				if (!run) return simpleResult(`No active run with ID: ${params.runId}`, true);
+				if (run.status !== "running") return simpleResult(`Run ${params.runId} is not running (status: ${run.status}). Use resume instead.`, true);
+				const session = run.session as RpcSession;
+				try {
+					session.followUp(params.task);
+				} catch (err: any) {
+					return simpleResult(`Failed to follow up: ${err.message}`, true);
+				}
+				return simpleResult(`Follow-up queued for run ${params.runId}.`);
+			}
+
+			// ── STEER action (interrupt running session) ──
+			if (action === "steer") {
+				if (!params.runId) return simpleResult("runId is required for steer action.", true);
+				if (!params.task) return simpleResult("task (message) is required for steer action.", true);
+				const run = getRun(params.runId);
+				if (!run) return simpleResult(`No active run with ID: ${params.runId}`, true);
+				if (run.status !== "running") return simpleResult(`Run ${params.runId} is not running (status: ${run.status}).`, true);
+				const session = run.session as RpcSession;
+				try {
+					session.steer(params.task);
+				} catch (err: any) {
+					return simpleResult(`Failed to steer: ${err.message}`, true);
+				}
+				return simpleResult(`Steering message sent to run ${params.runId}.`);
+			}
+
+			// ── RESUME action (restart idle session with prompt) ──
 			if (action === "resume") {
 				if (!params.runId) return simpleResult("runId is required for resume action.", true);
 				if (!params.task) return simpleResult("task is required for resume action.", true);
@@ -604,8 +637,7 @@ export default function (pi: ExtensionAPI) {
 				currentResult.errorMessage = accumulated.errorMessage ?? currentResult.errorMessage;
 
 				const output = getFinalOutput(currentResult.messages) || "(no output)";
-				const debug = `[debug] exitCode=${currentResult.exitCode} msgs=${accumulated.messages.length} turns=${accumulated.usage.turns} stderr="${accumulated.stderr.slice(0, 100)}" err="${currentResult.errorMessage ?? "none"}"`;
-				const text = output === "(no output)" ? `${debug}\n${output}` : output;
+				const text = output;
 
 				if (params.keepAlive && currentResult.exitCode === 0) {
 					updatePoolActivity(pooled.runId, currentResult.usage);
@@ -688,6 +720,24 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("subagent ")) +
 					theme.fg("warning", "release") +
 					theme.fg("dim", ` ${args.runId}`),
+					0, 0,
+				);
+			}
+			if (args.action === "follow_up") {
+				const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+				return new Text(
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", "follow_up") +
+					theme.fg("dim", ` ${args.runId}\n  ${preview}`),
+					0, 0,
+				);
+			}
+			if (args.action === "steer") {
+				const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+				return new Text(
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("warning", "steer") +
+					theme.fg("dim", ` ${args.runId}\n  ${preview}`),
 					0, 0,
 				);
 			}
@@ -919,48 +969,6 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 			return new Text(text, 0, 0);
-		},
-	});
-
-	// ── Register subagent_steer tool ──
-	pi.registerTool({
-		name: "subagent_steer",
-		label: "Subagent Steer",
-		description: "Send a steering message to a running async subagent. The message modifies the agent's current behavior without ending its turn.",
-		parameters: Type.Object({
-			runId: Type.String({ description: "The run ID returned by the async subagent call" }),
-			message: Type.String({ description: "The steering message to send to the running agent" }),
-		}),
-
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult<undefined>> {
-			const run = getRun(params.runId);
-			if (!run) {
-				return {
-					content: [{ type: "text", text: `No active run with ID: ${params.runId}` }],
-					details: undefined,
-				};
-			}
-			if (run.status !== "running") {
-				return {
-					content: [{ type: "text", text: `Run ${params.runId} is not running (status: ${run.status})` }],
-					details: undefined,
-				};
-			}
-
-			const session = run.session as RpcSession;
-			try {
-				session.steer(params.message);
-			} catch (err: any) {
-				return {
-					content: [{ type: "text", text: `Failed to steer: ${err.message}` }],
-					details: undefined,
-				};
-			}
-
-			return {
-				content: [{ type: "text", text: `Steering message sent to run ${params.runId}` }],
-				details: undefined,
-			};
 		},
 	});
 
