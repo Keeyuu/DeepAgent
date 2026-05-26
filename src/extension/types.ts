@@ -137,4 +137,6 @@ export interface AsyncRunInfo {
   agentSource: "user" | "project" | "unknown";
   /** Pending decision request from child (if any, async mode only) */
   pendingDecision?: PendingDecision;
+  /** Cleanup function to unsubscribe event listeners */
+  unsubEvents?: () => void;
 }

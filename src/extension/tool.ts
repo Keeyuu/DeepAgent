@@ -356,6 +356,7 @@ async function runSingleAgent(
 	// Wire up event accumulation
 	const unsubEvents = session.onEvent((event) => {
 		runInfo.events.push(event);
+		runInfo.unsubEvents = unsubEvents;
 		accumulateEvent(runInfo.accumulated, event);
 
 		// Streaming updates for chain/wait mode
@@ -388,7 +389,8 @@ async function runSingleAgent(
 				try {
 					poolRunId = addToPool(session, agentName, agent.source, runInfo.accumulated.usage);
 				} catch {
-					// Pool full — fall through to normal cleanup
+					// Pool full — stop session to avoid orphaned child process
+					session.stop().catch(() => {});
 					poolRunId = undefined;
 				}
 			} else if (fireAndForget) {
@@ -413,6 +415,22 @@ async function runSingleAgent(
 			message: (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request",
 			requestedAt: Date.now(),
 		};
+	});
+
+	// If process dies before agent_end (crash), clean up registry
+	const unsubClose = session.onClose((code) => {
+		if (runInfo.status === "running") {
+			runInfo.status = code === 0 ? "completed" : "failed";
+			unsubEvents();
+			unsubClose();
+			if (fireAndForget) {
+				// Delayed cleanup for fire-and-forget runs
+				setTimeout(() => {
+					removeRun(runId);
+					session.stop().catch(() => {});
+				}, 5_000);
+			}
+		}
 	});
 
 	// Wire abort signal
@@ -626,6 +644,31 @@ export default function (pi: ExtensionAPI) {
 					}
 				});
 
+				// Register in run-registry so subagent_status/subagent_respond can find it
+				const resumeRunInfo: AsyncRunInfo = {
+					id: pooled.runId,
+					agent: pooled.agent,
+					task: params.task,
+					status: "running",
+					session: pooled.session,
+					events: [],
+					accumulated,
+					startedAt: Date.now(),
+					agentSource: pooled.agentSource,
+				};
+				registerRun(resumeRunInfo);
+
+				// Wire onUIRequest so contact_supervisor(decision) works during resume
+				pooled.session.onUIRequest((req) => {
+					const fireAndForgetMethods = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
+					if (fireAndForgetMethods.includes(req.method)) return;
+					resumeRunInfo.pendingDecision = {
+						requestId: req.id,
+						message: (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request",
+						requestedAt: Date.now(),
+					};
+				});
+
 				pooled.session.followUp(`Task: ${params.task}`);
 
 				try {
@@ -635,6 +678,8 @@ export default function (pi: ExtensionAPI) {
 					currentResult.stderr = err.message;
 				} finally {
 					unsubResume();
+					// Remove from registry — resume tracking is done
+					removeRun(pooled.runId);
 				}
 
 				currentResult.messages = accumulated.messages;
@@ -1326,7 +1371,15 @@ export default function (pi: ExtensionAPI) {
 
 			// Send response via extension_ui_response → child unblocks
 			const session = run.session as RpcSession;
-			session.respondToUIRequest(run.pendingDecision.requestId, { value: params.response });
+			try {
+				session.respondToUIRequest(run.pendingDecision.requestId, { value: params.response });
+			} catch {
+				run.pendingDecision = undefined;
+				return {
+					content: [{ type: "text", text: `Failed to respond to run ${params.runId} — session may have already closed.` }],
+					details: undefined,
+				};
+			}
 			run.pendingDecision = undefined;
 
 			return {
@@ -1362,6 +1415,9 @@ export default function (pi: ExtensionAPI) {
 
 			run.status = "aborted";
 			const session = run.session as RpcSession;
+
+			// Unsubscribe event listeners first
+			if (run.unsubEvents) run.unsubEvents();
 
 			// Remove from registry first
 			removeRun(params.runId);
