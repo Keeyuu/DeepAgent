@@ -370,14 +370,17 @@ async function runSingleAgent(
 			}
 		});
 
-		// Framework UI requests from child — cancel with error.
-		// Subagent must NOT call ctx.ui; decisions go through contact_supervisor.
-		// Cancelling ensures any accidental ctx.ui usage fails visibly.
+		// Framework UI requests from child — async mode.
+		// contact_supervisor(decision) uses ctx.ui.input() → triggers extension_ui_request.
+		// Store as pending decision so parent LLM can respond via subagent_respond.
 		session.onUIRequest((req) => {
 			const fireAndForget = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
 			if (fireAndForget.includes(req.method)) return;
-			// Interactive UI request: cancel — subagent should use contact_supervisor instead
-			session.respondToUIRequest(req.id, { cancelled: true });
+			runInfo.pendingDecision = {
+				requestId: req.id,
+				message: (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request",
+				requestedAt: Date.now(),
+			};
 		});
 
 		// Wire abort signal
@@ -415,8 +418,10 @@ async function runSingleAgent(
 		};
 	}
 
-	// Framework UI requests from child — cancel with error.
-	// Same as sync mode: subagent must not call ctx.ui.
+	// Framework UI requests from child — sync mode.
+	// contact_supervisor(decision) uses ctx.ui.input() → triggers extension_ui_request.
+	// In sync mode, parent LLM is blocked waiting for tool result — auto-cancel.
+	// Child falls back to default value.
 	const uiUnsubscribe = session.onUIRequest((req) => {
 		const fireAndForget = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
 		if (fireAndForget.includes(req.method)) return;
@@ -507,7 +512,7 @@ export default function (pi: ExtensionAPI) {
 			description: "Send a message to the parent agent (supervisor). Use 'progress' for status updates, 'decision' for questions that need parent input. The parent will see your message in the task results and may respond via a follow-up steer.",
 			parameters: ContactSupervisorParams,
 
-			async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult<undefined>> {
+			async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<undefined>> {
 				if (params.type === "progress") {
 					// Progress update — returned as tool result text, visible to parent in output
 					return {
@@ -517,14 +522,29 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.type === "decision") {
-					// Decision request — returned as tool result text for parent to see.
-					// Parent LLM can respond via subagent_steer or followUp.
-					const opts = params.options?.length ? ` Options: ${params.options.join(", ")}` : "";
-					const dv = params.default_value ? ` Default: ${params.default_value}` : "";
-					return {
-						content: [{ type: "text", text: `[decision-request] ${params.message}${opts}${dv}\nWaiting for supervisor response via steer.` }],
-						details: undefined,
-					};
+					// Decision request — use ctx.ui.input() as transport layer.
+					// This triggers extension_ui_request via RPC → parent receives it.
+					// Parent responds via extension_ui_response → child unblocks.
+					// In sync mode, parent auto-replies with default value.
+					// In async mode, parent LLM decides and responds via subagent_respond tool.
+					const opts = params.options?.length ? `\nOptions: ${params.options.join(", ")}` : "";
+					const dv = params.default_value ? `\nDefault: ${params.default_value}` : "";
+					const prompt = `${params.message}${opts}${dv}`;
+
+					try {
+						const response = await ctx.ui.input("Supervisor Decision", prompt, { signal });
+						return {
+							content: [{ type: "text", text: response ?? params.default_value ?? "No response from supervisor." }],
+							details: undefined,
+						};
+					} catch (err: unknown) {
+						// Cancelled or timed out — use default value
+						const fallback = params.default_value ?? "No response (request cancelled).";
+						return {
+							content: [{ type: "text", text: `[decision-cancelled] ${fallback}` }],
+							details: undefined,
+						};
+					}
 				}
 
 				return {
@@ -1219,9 +1239,52 @@ export default function (pi: ExtensionAPI) {
 			if (output) {
 				parts.push(`\nOutput:\n${output}`);
 			}
+			if (run.pendingDecision) {
+				const waitSec = Math.round((Date.now() - run.pendingDecision.requestedAt) / 1000);
+				parts.push(`\n⏳ PENDING DECISION (waiting ${waitSec}s):`);
+				parts.push(run.pendingDecision.message);
+				parts.push("Use subagent_respond to answer.");
+			}
 
 			return {
 				content: [{ type: "text", text: parts.join("\n") }],
+				details: undefined,
+			};
+		},
+	});
+
+	// ── Register subagent_respond tool ──
+	pi.registerTool({
+		name: "subagent_respond",
+		label: "Subagent Respond",
+		description: "Respond to a pending decision request from an async subagent. The child is blocked waiting for your response. Use subagent_status first to see the pending question.",
+		parameters: Type.Object({
+			runId: Type.String({ description: "The run ID that has a pending decision" }),
+			response: Type.String({ description: "Your answer to the child's question" }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult<undefined>> {
+			const run = getRun(params.runId);
+			if (!run) {
+				return {
+					content: [{ type: "text", text: `No run found with ID: ${params.runId}.` }],
+					details: undefined,
+				};
+			}
+			if (!run.pendingDecision) {
+				return {
+					content: [{ type: "text", text: `Run ${params.runId} has no pending decision. Use subagent_status to check.` }],
+					details: undefined,
+				};
+			}
+
+			// Send response via extension_ui_response → child unblocks
+			const session = run.session as RpcSession;
+			session.respondToUIRequest(run.pendingDecision.requestId, { value: params.response });
+			run.pendingDecision = undefined;
+
+			return {
+				content: [{ type: "text", text: `Decision response sent to run ${params.runId}. The child will continue with your answer.` }],
 				details: undefined,
 			};
 		},

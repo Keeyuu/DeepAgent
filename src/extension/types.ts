@@ -97,6 +97,20 @@ export type RpcEvent =
 /** Status of an async subagent run */
 export type RunStatus = "running" | "completed" | "failed" | "aborted";
 
+/** Pending decision request from a child subagent (via extension_ui_request) */
+export interface PendingDecision {
+  /** The UI request ID to respond to */
+  requestId: string;
+  /** The child's question/message */
+  message: string;
+  /** Available options (if any) */
+  options?: string[];
+  /** Default value (if any) */
+  defaultValue?: string;
+  /** Timestamp when the request was received */
+  requestedAt: number;
+}
+
 /** Info tracked for each async subagent run */
 export interface AsyncRunInfo {
   /** Unique run ID */
@@ -119,4 +133,6 @@ export interface AsyncRunInfo {
   lastError?: string;
   /** Agent source (user/project) */
   agentSource: "user" | "project" | "unknown";
+  /** Pending decision request from child (if any, async mode only) */
+  pendingDecision?: PendingDecision;
 }
