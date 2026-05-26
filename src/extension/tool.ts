@@ -20,7 +20,7 @@ import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { discoverAgents } from "./agents.ts";
 import { randomUUID } from "node:crypto";
-import { accumulateResultFromEvents, accumulateEvent, getFinalOutput } from "./event-accumulator.ts";
+import { accumulateEvent, getFinalOutput } from "./event-accumulator.ts";
 import type {
 	AgentConfig,
 	AgentScope,
@@ -252,7 +252,6 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
-	async: Type.Optional(Type.Boolean({ description: "Run in background. Returns run ID immediately. Use subagent_steer/status/abort to interact. Only for single mode.", default: false })),
 });
 
 const ContactSupervisorParams = Type.Object({
@@ -263,6 +262,13 @@ const ContactSupervisorParams = Type.Object({
 
 // ── RPC-based agent runner ──────────────────────────────────────────────────
 
+/**
+ * Run a single agent via RPC session.
+ *
+ * All runs are registered in the run registry (async-friendly).
+ * - fireAndForget=true (single mode): returns immediately with run ID.
+ * - fireAndForget=false (chain/parallel): waits for completion and returns full result.
+ */
 async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
@@ -273,7 +279,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	asyncMode: boolean = false,
+	fireAndForget: boolean = false,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -290,27 +296,6 @@ async function runSingleAgent(
 			step,
 		};
 	}
-
-	const currentResult: SingleResult = {
-		agent: agentName,
-		agentSource: agent.source,
-		task,
-		exitCode: 0,
-		messages: [],
-		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
-		step,
-	};
-
-	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
-		}
-	};
 
 	const session = new RpcSession({
 		cwd: cwd ?? defaultCwd,
@@ -329,80 +314,95 @@ async function runSingleAgent(
 		await session.start();
 	} catch (err: any) {
 		return {
-			...currentResult,
+			agent: agentName,
+			agentSource: agent.source,
+			task,
 			exitCode: 1,
+			messages: [],
 			stderr: `Failed to start RPC session: ${err.message}`,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			step,
 		};
 	}
 
-	// ── Async mode: register run and return immediately ──
-	if (asyncMode) {
-		const runId = randomUUID();
-		const runInfo: AsyncRunInfo = {
-			id: runId,
-			agent: agentName,
-			task,
-			status: "running",
-			session,
-			events: [],
-			accumulated: {
-				messages: [],
-				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-				stderr: "",
-			},
-			startedAt: Date.now(),
-			agentSource: agent.source,
-		};
+	// ── Register run ──
+	const runId = randomUUID();
+	const runInfo: AsyncRunInfo = {
+		id: runId,
+		agent: agentName,
+		task,
+		status: "running",
+		session,
+		events: [],
+		accumulated: {
+			messages: [],
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			stderr: "",
+		},
+		startedAt: Date.now(),
+		agentSource: agent.source,
+	};
 
-		// Wire up background event accumulation
-		session.onEvent((event) => {
-			runInfo.events.push(event);
-			accumulateEvent(runInfo.accumulated, event);
+	// Wire up event accumulation + streaming updates
+	session.onEvent((event) => {
+		runInfo.events.push(event);
+		accumulateEvent(runInfo.accumulated, event);
 
-			if (event.type === "agent_end") {
-				runInfo.status = "completed";
-				// Auto-cleanup after delay to allow status queries
-				setTimeout(() => {
-					removeRun(runId);
-					session.stop().catch(() => {});
-				}, 60_000);
-			}
-		});
-
-		// Framework UI requests from child — async mode.
-		// contact_supervisor(decision) uses ctx.ui.input() → triggers extension_ui_request.
-		// Store as pending decision so parent LLM can respond via subagent_respond.
-		session.onUIRequest((req) => {
-			const fireAndForget = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
-			if (fireAndForget.includes(req.method)) return;
-			runInfo.pendingDecision = {
-				requestId: req.id,
-				message: (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request",
-				requestedAt: Date.now(),
-			};
-		});
-
-		// Wire abort signal
-		if (signal) {
-			const killSession = async () => {
-				runInfo.status = "aborted";
-				try { session.abort(); } catch { /* ignore */ }
-				setTimeout(() => {
-					removeRun(runId);
-					session.stop().catch(() => {});
-				}, 1000);
-			};
-			if (signal.aborted) killSession();
-			else signal.addEventListener("abort", killSession, { once: true });
+		// Emit streaming updates for chain/parallel callers
+		if (!fireAndForget && onUpdate) {
+			onUpdate({
+				content: [{ type: "text", text: getFinalOutput(runInfo.accumulated.messages) || "(running...)" }],
+				details: makeDetails([{
+					agent: agentName,
+					agentSource: agent.source,
+					task,
+					exitCode: -1,
+					messages: runInfo.accumulated.messages,
+					stderr: "",
+					usage: runInfo.accumulated.usage,
+					model: runInfo.accumulated.model ?? agent.model,
+					step,
+				}]),
+			});
 		}
 
-		// Register the run
-		registerRun(runInfo);
+		if (event.type === "agent_end") {
+			runInfo.status = "completed";
+		}
+	});
 
-		// Send the task prompt
-		session.prompt(`Task: ${task}`);
+	// Framework UI requests from child.
+	// contact_supervisor(decision) uses ctx.ui.input() → triggers extension_ui_request.
+	// Store as pending decision so parent LLM can respond via subagent_respond.
+	session.onUIRequest((req) => {
+		const fireAndForgetMethods = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
+		if (fireAndForgetMethods.includes(req.method)) return;
+		runInfo.pendingDecision = {
+			requestId: req.id,
+			message: (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request",
+			requestedAt: Date.now(),
+		};
+	});
 
-		// Return immediately with run ID
+	// Wire abort signal
+	if (signal) {
+		const killSession = async () => {
+			runInfo.status = "aborted";
+			try { session.abort(); } catch { /* ignore */ }
+			setTimeout(() => {
+				removeRun(runId);
+				session.stop().catch(() => {});
+			}, 1000);
+		};
+		if (signal.aborted) killSession();
+		else signal.addEventListener("abort", killSession, { once: true });
+	}
+
+	registerRun(runInfo);
+	session.prompt(`Task: ${task}`);
+
+	// ── Fire-and-forget: return immediately with run ID ──
+	if (fireAndForget) {
 		return {
 			agent: agentName,
 			agentSource: agent.source,
@@ -417,81 +417,36 @@ async function runSingleAgent(
 		};
 	}
 
-	// Framework UI requests from child — sync mode.
-	// contact_supervisor(decision) uses ctx.ui.input() → triggers extension_ui_request.
-	// In sync mode, parent LLM is blocked waiting for tool result — auto-cancel.
-	// Child falls back to default value.
-	const uiUnsubscribe = session.onUIRequest((req) => {
-		const fireAndForget = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
-		if (fireAndForget.includes(req.method)) return;
-		session.respondToUIRequest(req.id, { cancelled: true });
-	});
-
-	// Track events for accumulation
-	const events: RpcEvent[] = [];
-	const eventUnsubscribe = session.onEvent((event) => {
-		events.push(event);
-		// Emit streaming updates
-		const partial = accumulateResultFromEvents(events);
-		currentResult.messages = partial.messages;
-		currentResult.usage = partial.usage;
-		currentResult.model = partial.model;
-		currentResult.stopReason = partial.stopReason;
-		currentResult.errorMessage = partial.errorMessage;
-		emitUpdate();
-	});
-
-	let wasAborted = false;
-
-	// Wire up abort signal
-	if (signal) {
-		const killSession = async () => {
-			wasAborted = true;
-			try { session.abort(); } catch { /* ignore */ }
-			// Give it a moment, then force stop
-			setTimeout(() => {
-				try { session.stop(); } catch { /* ignore */ }
-			}, 5000);
-		};
-		if (signal.aborted) killSession();
-		else signal.addEventListener("abort", killSession, { once: true });
-	}
-
-	// Send the task as a prompt
-	session.prompt(`Task: ${task}`);
-
-	// Wait for agent to finish (idle heartbeat, configurable via subagentIdleTimeoutMs)
+	// ── Wait for completion (chain/parallel) ──
 	try {
 		await session.waitForIdle(subagentConfig.idleTimeoutMs);
 	} catch (err: any) {
-		// Idle timeout — child stopped producing events
-		currentResult.exitCode = 1;
-		currentResult.stderr = err.message;
-	} finally {
-		uiUnsubscribe();
-		eventUnsubscribe();
+		runInfo.status = "failed";
 	}
 
-	// Final accumulation
-	const final = accumulateResultFromEvents(events);
-	currentResult.messages = final.messages;
-	currentResult.usage = final.usage;
-	currentResult.model = final.model ?? currentResult.model;
-	currentResult.stopReason = final.stopReason ?? currentResult.stopReason;
-	currentResult.errorMessage = final.errorMessage ?? currentResult.errorMessage;
-	currentResult.stderr = session.getStderr();
+	// Build final result from accumulated events
+	const final = runInfo.accumulated;
+	const result: SingleResult = {
+		agent: agentName,
+		agentSource: agent.source,
+		task,
+		exitCode: session.getExitCode() ?? (runInfo.status === "completed" ? 0 : 1),
+		messages: final.messages,
+		stderr: session.getStderr(),
+		usage: final.usage,
+		model: final.model ?? agent.model,
+		stopReason: final.stopReason,
+		errorMessage: final.errorMessage,
+		step,
+	};
 
-	const exitCode = session.getExitCode();
-	if (exitCode !== null) currentResult.exitCode = exitCode;
+	// Auto-cleanup after delay
+	setTimeout(() => {
+		removeRun(runId);
+		session.stop().catch(() => {});
+	}, 60_000);
 
-	// Clean up
-	await session.stop();
-
-	if (wasAborted) {
-		throw new Error("Subagent was aborted");
-	}
-
-	return currentResult;
+	return result;
 }
 
 // ── Extension entry point ──────────────────────────────────────────────────
@@ -521,9 +476,7 @@ export default function (pi: ExtensionAPI) {
 
 				if (params.type === "decision") {
 					// Decision request — use ctx.ui.input() as blocking transport.
-					// Parent receives extension_ui_request, responds when ready.
-					// If parent cancels (sync mode), child run ends and parent sees
-					// the decision request in the result — can restart with an answer.
+					// Parent receives extension_ui_request via run registry, responds via subagent_respond.
 					const opts = params.options?.length ? `\nOptions: ${params.options.join(", ")}` : "";
 					const prompt = `${params.message}${opts}`;
 
@@ -534,10 +487,9 @@ export default function (pi: ExtensionAPI) {
 							details: undefined,
 						};
 					} catch {
-						// Parent cancelled (sync mode) — end the run so parent can see
-						// the decision request and respond in a follow-up invocation.
+						// Parent cancelled or timed out — end the run.
 						return {
-							content: [{ type: "text", text: `[decision-request] ${params.message}${opts}\nWaiting for supervisor's response.` }],
+							content: [{ type: "text", text: `[decision-request] ${params.message}${opts}\nNo supervisor response received.` }],
 							details: undefined,
 							terminate: true,
 						} as AgentToolResult<undefined>;
@@ -562,6 +514,8 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Single mode is fire-and-forget: returns run ID immediately. Use subagent_status to check progress and get results.",
+			"Parallel and chain modes wait for all tasks to complete before returning.",
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
 		].join(" "),
@@ -759,17 +713,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// ── Single mode ──
+			// ── Single mode ── (always fire-and-forget: returns run ID immediately)
 			if (params.agent && params.task) {
-				const isAsync = params.async ?? false;
-
-				if (isAsync && (hasChain || hasTasks)) {
-					return {
-						content: [{ type: "text", text: "Async mode is only supported for single task mode (agent + task)." }],
-						details: makeDetails("single")([]),
-					};
-				}
-
 				const result = await runSingleAgent(
 					ctx.cwd,
 					agents,
@@ -780,27 +725,11 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					onUpdate,
 					makeDetails("single"),
-					isAsync,
+					true, // fireAndForget — parent polls via subagent_status
 				);
 
-				if (isAsync) {
-					return {
-						content: [{ type: "text", text: result.errorMessage || "Async run started." }],
-						details: makeDetails("single")([result]),
-					};
-				}
-
-				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
-					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-						details: makeDetails("single")([result]),
-						isError: true,
-					};
-				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
+					content: [{ type: "text", text: result.errorMessage || "Run started." }],
 					details: makeDetails("single")([result]),
 				};
 			}
