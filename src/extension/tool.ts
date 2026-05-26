@@ -536,58 +536,22 @@ export default function (pi: ExtensionAPI) {
 				return simpleResult(`Steering message sent to run ${params.runId}.`);
 			}
 
-			// ── RESUME action (restart idle session with prompt) ──
+			// ── RESUME action (async: prompt idle session, return runId immediately) ──
 			if (action === "resume") {
 				if (!params.runId) return simpleResult("runId is required for resume action.", true);
 				if (!params.task) return simpleResult("task is required for resume action.", true);
 				const pooled = getFromPool(params.runId);
 				if (!pooled) return simpleResult(`No active session with runId "${params.runId}". Available: ${getPoolRunIds().join(", ") || "none"}`, true);
 
+				if (!pooled.session.isAlive()) {
+					removeFromPool(params.runId);
+					return simpleResult(`Session ${params.runId} is dead (child process exited).`, true);
+				}
+
 				pooled.lastActivityAt = Date.now();
+				const keepAlive = params.keepAlive ?? false;
 
-				const accumulated: AccumulatedResult = {
-					messages: [],
-					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					stderr: "",
-				};
-
-				const currentResult: SingleResult = {
-					agent: pooled.agent,
-					agentSource: pooled.agentSource,
-					task: params.task,
-					exitCode: 0,
-					messages: [],
-					stderr: "",
-					usage: { ...pooled.usage },
-				};
-
-				const agentScope: AgentScope = params.agentScope ?? "user";
-				const makeResumeDetails = (results: SingleResult[]): SubagentDetails => ({
-					agentScope,
-					projectAgentsDir: null,
-					results,
-					runId: pooled.runId,
-				});
-
-				const unsubResume = pooled.session.onEvent((event) => {
-					accumulateEvent(accumulated, event);
-					if (onUpdate) {
-						onUpdate({
-							content: [{ type: "text", text: getFinalOutput(accumulated.messages) || "(running...)" }],
-							details: makeResumeDetails([{
-								...currentResult,
-								messages: accumulated.messages,
-								usage: accumulated.usage,
-								model: accumulated.model,
-							}]),
-						});
-					}
-					if (event.type === "agent_end") {
-						currentResult.exitCode = pooled.session.getExitCode() ?? 0;
-					}
-				});
-
-				// Register in run-registry so subagent_status/subagent_respond can find it
+				// Build run info for the registry
 				const resumeRunInfo: AsyncRunInfo = {
 					id: pooled.runId,
 					agent: pooled.agent,
@@ -595,73 +559,63 @@ export default function (pi: ExtensionAPI) {
 					status: "running",
 					session: pooled.session,
 					events: [],
-					accumulated,
+					accumulated: { messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 }, stderr: "" },
 					startedAt: Date.now(),
 					agentSource: pooled.agentSource,
 				};
-				registerRun(resumeRunInfo);
 
-				// Wire onUIRequest — forward to parent user to avoid deadlock
-				// (parent blocked on waitForIdle, can't call subagent_respond)
-				pooled.session.onUIRequest((req) => {
-					const fireAndForgetMethods = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
-					if (fireAndForgetMethods.includes(req.method)) return;
-					const message = (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request";
-					if (ctx?.hasUI) {
-						ctx.ui.input("Child Decision", message).then((response) => {
-							pooled.session.respondToUIRequest(req.id, { value: response ?? "" });
-						}).catch(() => {
-							pooled.session.respondToUIRequest(req.id, { cancelled: true });
-						});
-					} else {
-						resumeRunInfo.pendingDecision = { requestId: req.id, message, requestedAt: Date.now() };
+				// Wire event accumulation + keepAlive/auto-cleanup on agent_end
+				const unsubEvents = pooled.session.onEvent((event) => {
+					resumeRunInfo.events.push(event);
+					resumeRunInfo.unsubEvents = unsubEvents;
+					accumulateEvent(resumeRunInfo.accumulated, event);
+
+					if (event.type === "agent_end") {
+						resumeRunInfo.status = "completed";
+						removeFromPool(pooled.runId);
+						if (keepAlive && pooled.session.getExitCode() === null) {
+							// Re-pool for further resume
+							unsubEvents();
+							removeRun(pooled.runId);
+							try { addToPool(pooled.session, pooled.agent, pooled.agentSource, resumeRunInfo.accumulated.usage, pooled.runId); } catch { pooled.session.stop().catch(() => {}); }
+						} else {
+							// Auto-cleanup 60s after completion
+							setTimeout(() => { unsubEvents(); removeRun(pooled.runId); pooled.session.stop().catch(() => {}); }, 60_000);
+						}
 					}
 				});
 
-				if (!pooled.session.isAlive()) {
-					removeFromPool(pooled.runId);
-					return simpleResult(`Session ${params.runId} is dead (child process exited). Session removed from pool.`, true);
-				}
+				// Wire onUIRequest for contact_supervisor — store as pendingDecision
+				// Parent LLM responds via subagent_respond (same as launchAgent)
+				pooled.session.onUIRequest((req) => {
+					const ff = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
+					if (ff.includes(req.method)) return;
+					resumeRunInfo.pendingDecision = {
+						requestId: req.id,
+						message: (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request",
+						requestedAt: Date.now(),
+					};
+				});
 
+				// Wire onClose for crash detection
+				const unsubClose = pooled.session.onClose((code) => {
+					if (resumeRunInfo.status === "running") {
+						resumeRunInfo.status = code === 0 ? "completed" : "failed";
+						unsubEvents();
+						unsubClose();
+						removeFromPool(pooled.runId);
+						setTimeout(() => { removeRun(pooled.runId); pooled.session.stop().catch(() => {}); }, 5_000);
+					}
+				});
+
+				registerRun(resumeRunInfo);
 				pooled.session.prompt(`Task: ${params.task}`);
 
-				try {
-					await pooled.session.waitForIdle(subagentConfig.idleTimeoutMs);
-				} catch (err: any) {
-					currentResult.exitCode = 1;
-					currentResult.stderr = err.message;
-				} finally {
-					unsubResume();
-					// Remove from registry — resume tracking is done
-					removeRun(pooled.runId);
-				}
-
-				currentResult.messages = accumulated.messages;
-				currentResult.usage = accumulated.usage;
-				currentResult.model = accumulated.model ?? currentResult.model;
-				currentResult.stopReason = accumulated.stopReason ?? currentResult.stopReason;
-				currentResult.errorMessage = accumulated.errorMessage ?? currentResult.errorMessage;
-
-				const output = getFinalOutput(currentResult.messages) || "(no output)";
-				const text = output;
-
-				if (params.keepAlive && currentResult.exitCode === 0) {
-					updatePoolActivity(pooled.runId, currentResult.usage);
-					currentResult.runId = pooled.runId;
-					return {
-						content: [{ type: "text", text }],
-						details: makeResumeDetails([currentResult]),
-					};
-				}
-
-				await pooled.session.stop().catch(() => {});
-				removeFromPool(pooled.runId);
 				return {
-					content: [{ type: "text", text }],
-					details: makeResumeDetails([currentResult]),
+					content: [{ type: "text", text: `Resumed ${pooled.runId}. Use subagent_status to track.` }],
+					details: { agentScope: params.agentScope ?? "user" as AgentScope, projectAgentsDir: null, results: [{ agent: pooled.agent, agentSource: pooled.agentSource, task: params.task, exitCode: EXIT_CODE_PENDING, messages: [], stderr: "", usage: { ...pooled.usage }, errorMessage: `Resumed. Run ID: ${pooled.runId}` }] },
 				};
 			}
-
 			// ── RUN action (default) ──
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
