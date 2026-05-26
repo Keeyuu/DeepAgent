@@ -381,14 +381,14 @@ async function runSingleAgent(
 				try {
 					if (req.method === "confirm") {
 						const confirmed = await ctx.ui.confirm(
-							req.title ?? "Child Agent Confirmation",
-							req.message ?? "Confirm?",
+							String(req.title ?? "Child Agent Confirmation"),
+							String(req.message ?? "Confirm?"),
 						);
 						session.respondToUIRequest(req.id, { confirmed });
 					} else if (req.method === "input") {
 						const value = await ctx.ui.input(
-							req.title ?? "Child Agent Input",
-							req.placeholder,
+							String(req.title ?? "Child Agent Input"),
+							req.placeholder as string | undefined,
 						);
 						if (value !== undefined) {
 							session.respondToUIRequest(req.id, { value });
@@ -398,7 +398,7 @@ async function runSingleAgent(
 					} else if (req.method === "select") {
 						const opts = req.options as string[] | undefined;
 						const value = await ctx.ui.select(
-							req.title ?? "Child Agent Selection",
+							String(req.title ?? "Child Agent Selection"),
 							opts ?? [],
 						);
 						if (value !== undefined) {
@@ -409,7 +409,7 @@ async function runSingleAgent(
 					} else if (req.method === "editor") {
 						// editor: use input as approximation (no editor in ctx.ui)
 						const value = await ctx.ui.input(
-							req.title ?? "Child Agent Editor",
+							String(req.title ?? "Child Agent Editor"),
 							req.prefill as string | undefined,
 						);
 						if (value !== undefined) {
@@ -861,6 +861,7 @@ export default function (pi: ExtensionAPI) {
 					onUpdate,
 					makeDetails("single"),
 					isAsync,
+					ctx,
 				);
 
 				if (isAsync) {
