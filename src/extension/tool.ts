@@ -26,7 +26,6 @@ import type {
 	AgentScope,
 	AsyncRunInfo,
 	DisplayItem,
-	OnUpdateCallback,
 	RpcEvent,
 	RunStatus,
 	SingleResult,
@@ -41,7 +40,6 @@ import { registerRun, getRun, removeRun, getActiveRunCount, getAllRuns } from ".
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const EXIT_CODE_PENDING = -1; // Signals a run is still in progress
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000; // 5 minutes
 
@@ -193,21 +191,6 @@ function getResultOutput(result: SingleResult): string {
 	return getFinalOutput(result.messages) || "(no output)";
 }
 
-function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	// Truncate by byte boundary to avoid breaking UTF-8 surrogate pairs.
-	// Start from PER_TASK_OUTPUT_CAP and walk back to a valid UTF-8 boundary.
-	const buf = Buffer.from(output, "utf8");
-	let end = PER_TASK_OUTPUT_CAP;
-	// If we cut in the middle of a multi-byte sequence, back up.
-	// A valid UTF-8 continuation byte is 0x80–0xBF (starts with 10xxxxxx).
-	while (end > 0 && (buf[end] & 0xC0) === 0x80) end--;
-	const truncated = buf.subarray(0, end).toString("utf8");
-	const omittedBytes = byteLength - end;
-	return `${truncated}\n\n[Output truncated: ${omittedBytes} bytes omitted. Full output preserved in tool details.]`;
-}
 
 async function mapWithConcurrencyLimit<TIn, TOut>(
 	items: TIn[],
@@ -269,11 +252,9 @@ const ContactSupervisorParams = Type.Object({
 // ── RPC-based agent runner ──────────────────────────────────────────────────
 
 /**
- * Run a single agent via RPC session.
- *
- * All runs are registered in the run registry (async-friendly).
- * - fireAndForget=true (single mode): returns immediately with run ID.
- * - fireAndForget=false (chain/parallel): waits for completion and returns full result.
+ * Run a single agent via RPC session. Always fire-and-forget:
+ * registers the run and returns immediately with the run ID.
+ * Use subagent_status / subagent_respond / subagent_abort to interact.
  */
 async function runSingleAgent(
 	defaultCwd: string,
@@ -283,9 +264,6 @@ async function runSingleAgent(
 	cwd: string | undefined,
 	step: number | undefined,
 	signal: AbortSignal | undefined,
-	onUpdate: OnUpdateCallback | undefined,
-	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	fireAndForget: boolean = false,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -349,31 +327,18 @@ async function runSingleAgent(
 		agentSource: agent.source,
 	};
 
-	// Wire up event accumulation + streaming updates
-	const unsubEvents = session.onEvent((event) => {
+	// Wire up event accumulation
+	session.onEvent((event) => {
 		runInfo.events.push(event);
 		accumulateEvent(runInfo.accumulated, event);
 
-		// Emit streaming updates for chain/parallel callers
-		if (!fireAndForget && onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(runInfo.accumulated.messages) || "(running...)" }],
-				details: makeDetails([{
-					agent: agentName,
-					agentSource: agent.source,
-					task,
-					exitCode: EXIT_CODE_PENDING,
-					messages: runInfo.accumulated.messages,
-					stderr: "",
-					usage: runInfo.accumulated.usage,
-					model: runInfo.accumulated.model ?? agent.model,
-					step,
-				}]),
-			});
-		}
-
 		if (event.type === "agent_end") {
 			runInfo.status = "completed";
+			// Auto-cleanup after delay to allow status queries
+			setTimeout(() => {
+				removeRun(runId);
+				session.stop().catch(() => {});
+			}, 60_000);
 		}
 	});
 
@@ -408,53 +373,18 @@ async function runSingleAgent(
 	registerRun(runInfo);
 	session.prompt(`Task: ${task}`);
 
-	// ── Fire-and-forget: return immediately with run ID ──
-	if (fireAndForget) {
-		return {
-			agent: agentName,
-			agentSource: agent.source,
-			task,
-			exitCode: EXIT_CODE_PENDING,
-			messages: [],
-			stderr: "",
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-			model: agent.model,
-			step,
-			errorMessage: `Async run started. Run ID: ${runId}`,
-		};
-	}
-
-	// ── Wait for completion (chain/parallel) ──
-	try {
-		await session.waitForIdle(subagentConfig.idleTimeoutMs);
-	} catch (err: any) {
-		runInfo.status = "failed";
-	}
-
-	// Build final result from accumulated events
-	const final = runInfo.accumulated;
-	const result: SingleResult = {
+	return {
 		agent: agentName,
 		agentSource: agent.source,
 		task,
-		exitCode: session.getExitCode() ?? (runInfo.status === "completed" ? 0 : 1),
-		messages: final.messages,
-		stderr: session.getStderr(),
-		usage: final.usage,
-		model: final.model ?? agent.model,
-		stopReason: final.stopReason,
-		errorMessage: final.errorMessage,
+		exitCode: EXIT_CODE_PENDING,
+		messages: [],
+		stderr: "",
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		model: agent.model,
 		step,
+		errorMessage: `Async run started. Run ID: ${runId}`,
 	};
-
-	// Auto-cleanup after delay (unsub listeners + stop session)
-	setTimeout(() => {
-		unsubEvents();
-		removeRun(runId);
-		session.stop().catch(() => {});
-	}, 60_000);
-
-	return result;
 }
 
 // ── Extension entry point ──────────────────────────────────────────────────
@@ -529,7 +459,7 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		parameters: SubagentParams,
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
@@ -587,101 +517,45 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// ── Chain mode ──
+			// ── Chain mode: launch all steps as independent async runs ──
 			if (params.chain && params.chain.length > 0) {
 				const results: SingleResult[] = [];
-				let previousOutput = "";
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
-
+					// {previous} is left as-is; chain orchestration (sequential deps) is a future phase
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
 						step.agent,
-						taskWithContext,
+						step.task,
 						step.cwd,
 						i + 1,
 						signal,
-						chainUpdate,
-						makeDetails("chain"),
 					);
 					results.push(result);
-
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
-					}
-					previousOutput = getFinalOutput(result.messages);
 				}
+
+				const lines = results.map((r, i) => {
+					const runId = r.errorMessage?.match(/Run ID: ([\w-]+)/)?.[1] ?? "?";
+					return `${i + 1}. [${r.agent}] → ${runId}`;
+				});
 				return {
-					content: [
-						{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" },
-					],
+					content: [{ type: "text", text: `Chain launched (${results.length} steps). Use subagent_status to track.\n${lines.join("\n")}` }],
 					details: makeDetails("chain")(results),
 				};
 			}
 
-			// ── Parallel mode ──
+			// ── Parallel mode: launch all tasks as independent async runs ──
 			if (params.tasks && params.tasks.length > 0) {
 				if (params.tasks.length > MAX_PARALLEL_TASKS)
 					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
+						content: [{ type: "text", text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
 						details: makeDetails("parallel")([]),
 					};
 
-				const allResults: SingleResult[] = new Array(params.tasks.length);
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: EXIT_CODE_PENDING,
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					};
-				}
-
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === EXIT_CODE_PENDING).length;
-						const done = allResults.filter((r) => r.exitCode !== EXIT_CODE_PENDING).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
-					}
-				};
-
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
+				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t) => {
+					return await runSingleAgent(
 						ctx.cwd,
 						agents,
 						t.agent,
@@ -689,39 +563,20 @@ export default function (pi: ExtensionAPI) {
 						t.cwd,
 						undefined,
 						signal,
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
 					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
 				});
 
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const summaries = results.map((r) => {
-					const output = truncateParallelOutput(getResultOutput(r));
-					const status = isFailedResult(r)
-						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-						: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
+				const lines = results.map((r) => {
+					const runId = r.errorMessage?.match(/Run ID: ([\w-]+)/)?.[1] ?? "?";
+					return `- [${r.agent}] → ${runId}`;
 				});
 				return {
-					content: [
-						{
-							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
-						},
-					],
+					content: [{ type: "text", text: `Parallel launched (${results.length} tasks). Use subagent_status to track.\n${lines.join("\n")}` }],
 					details: makeDetails("parallel")(results),
 				};
 			}
 
-			// ── Single mode ── (always fire-and-forget: returns run ID immediately)
+			// ── Single mode: fire-and-forget, returns run ID immediately ──
 			if (params.agent && params.task) {
 				const result = await runSingleAgent(
 					ctx.cwd,
@@ -731,9 +586,6 @@ export default function (pi: ExtensionAPI) {
 					params.cwd,
 					undefined,
 					signal,
-					onUpdate,
-					makeDetails("single"),
-					true, // fireAndForget — parent polls via subagent_status
 				);
 
 				return {
