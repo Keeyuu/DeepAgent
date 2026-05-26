@@ -579,7 +579,12 @@ export default function (pi: ExtensionAPI) {
 					};
 				});
 
-				pooled.session.followUp(`Task: ${params.task}`);
+				if (!pooled.session.isAlive()) {
+					removeFromPool(pooled.runId);
+					return simpleResult(`Session ${params.runId} is dead (child process exited). Session removed from pool.`, true);
+				}
+
+				pooled.session.prompt(`Task: ${params.task}`);
 
 				try {
 					await pooled.session.waitForIdle(subagentConfig.idleTimeoutMs);
@@ -598,11 +603,15 @@ export default function (pi: ExtensionAPI) {
 				currentResult.stopReason = accumulated.stopReason ?? currentResult.stopReason;
 				currentResult.errorMessage = accumulated.errorMessage ?? currentResult.errorMessage;
 
+				const output = getFinalOutput(currentResult.messages) || "(no output)";
+				const debug = `[debug] exitCode=${currentResult.exitCode} msgs=${accumulated.messages.length} turns=${accumulated.usage.turns} stderr="${accumulated.stderr.slice(0, 100)}" err="${currentResult.errorMessage ?? "none"}"`;
+				const text = output === "(no output)" ? `${debug}\n${output}` : output;
+
 				if (params.keepAlive && currentResult.exitCode === 0) {
 					updatePoolActivity(pooled.runId, currentResult.usage);
 					currentResult.runId = pooled.runId;
 					return {
-						content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(no output)" }],
+						content: [{ type: "text", text }],
 						details: makeResumeDetails([currentResult]),
 					};
 				}
@@ -610,7 +619,7 @@ export default function (pi: ExtensionAPI) {
 				await pooled.session.stop().catch(() => {});
 				removeFromPool(pooled.runId);
 				return {
-					content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(no output)" }],
+					content: [{ type: "text", text }],
 					details: makeResumeDetails([currentResult]),
 				};
 			}
