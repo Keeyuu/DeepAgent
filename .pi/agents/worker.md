@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Minimal child worker for bounded isolated tasks.
-tools: read, grep, find, ls, bash, edit, write
+tools: read, grep, find, ls, bash, edit, write, contact_supervisor
 ---
 
 You are the V1 child worker. Execute exactly the delegated task.

@@ -31,6 +31,8 @@ export interface RpcSessionOptions {
   systemPrompt?: string;
   /** Additional CLI arguments */
   args?: string[];
+  /** Absolute path to extension to load in child process (for contact_supervisor bridge) */
+  childExtensionPath?: string;
 }
 
 /** Pending extension UI request from child */
@@ -129,6 +131,12 @@ export class RpcSession {
     }
     if (this.options.args) {
       args.push(...this.options.args);
+    }
+
+    // Auto-load the child bridge extension so contact_supervisor is available
+    // when SUBAGENT_CHILD=1 is set.
+    if (this.options.childExtensionPath) {
+      args.push("--extension", this.options.childExtensionPath);
     }
 
     return args;

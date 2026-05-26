@@ -12,7 +12,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -275,6 +275,7 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	asyncMode: boolean = false,
+	ctx?: ExtensionContext,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -323,6 +324,7 @@ async function runSingleAgent(
 		tools: agent.tools,
 		systemPrompt: agent.systemPrompt,
 		args: ["-p"],
+		childExtensionPath: path.join(defaultCwd, ".pi", "extensions", "subagent", "index.ts"),
 	});
 
 	try {
@@ -369,10 +371,63 @@ async function runSingleAgent(
 			}
 		});
 
-		// Handle UI requests in background (auto-respond with defaults)
-		session.onUIRequest((req) => {
+		// Handle UI requests: forward to parent user via ctx.ui, or auto-respond if no ctx
+		session.onUIRequest(async (req) => {
 			const fireAndForget = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
 			if (fireAndForget.includes(req.method)) return;
+
+			// Forward interactive requests to parent user
+			if (ctx) {
+				try {
+					if (req.method === "confirm") {
+						const confirmed = await ctx.ui.confirm(
+							req.title ?? "Child Agent Confirmation",
+							req.message ?? "Confirm?",
+						);
+						session.respondToUIRequest(req.id, { confirmed });
+					} else if (req.method === "input") {
+						const value = await ctx.ui.input(
+							req.title ?? "Child Agent Input",
+							req.placeholder,
+						);
+						if (value !== undefined) {
+							session.respondToUIRequest(req.id, { value });
+						} else {
+							session.respondToUIRequest(req.id, { cancelled: true });
+						}
+					} else if (req.method === "select") {
+						const opts = req.options as string[] | undefined;
+						const value = await ctx.ui.select(
+							req.title ?? "Child Agent Selection",
+							opts ?? [],
+						);
+						if (value !== undefined) {
+							session.respondToUIRequest(req.id, { value });
+						} else {
+							session.respondToUIRequest(req.id, { cancelled: true });
+						}
+					} else if (req.method === "editor") {
+						// editor: use input as approximation (no editor in ctx.ui)
+						const value = await ctx.ui.input(
+							req.title ?? "Child Agent Editor",
+							req.prefill as string | undefined,
+						);
+						if (value !== undefined) {
+							session.respondToUIRequest(req.id, { value });
+						} else {
+							session.respondToUIRequest(req.id, { cancelled: true });
+						}
+					} else {
+						session.respondToUIRequest(req.id, { cancelled: true });
+					}
+				} catch {
+					// If parent UI fails, auto-respond to avoid blocking child
+					session.respondToUIRequest(req.id, { cancelled: true });
+				}
+				return;
+			}
+
+			// Fallback: auto-respond with defaults (no ctx available)
 			if (req.method === "confirm") session.respondToUIRequest(req.id, { confirmed: true });
 			else if (req.method === "input") session.respondToUIRequest(req.id, { value: String(req.default_value ?? "") });
 			else if (req.method === "select") {
@@ -418,15 +473,15 @@ async function runSingleAgent(
 	}
 
 	// Handle extension UI requests (confirm/input from child)
+	// NOTE: async mode already returned to caller — ctx is no longer available,
+	// so we must auto-respond. Sync mode (above) forwards to parent user instead.
 	const uiUnsubscribe = session.onUIRequest((req) => {
 		// Fire-and-forget methods: notify, setStatus, setTitle, setWidget, set_editor_text
 		const fireAndForget = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
 		if (fireAndForget.includes(req.method)) {
-			// Log but don't respond
 			return;
 		}
-		// For confirm/input/select/editor: auto-respond with default or cancel
-		// In a future phase, this would forward to parent agent for decision
+		// Auto-respond with sensible defaults for async mode
 		if (req.method === "confirm") {
 			session.respondToUIRequest(req.id, { confirmed: true });
 		} else if (req.method === "input") {
@@ -437,7 +492,6 @@ async function runSingleAgent(
 		} else if (req.method === "editor") {
 			session.respondToUIRequest(req.id, { value: String(req.prefill ?? "") });
 		} else {
-			// Unknown method: cancel
 			session.respondToUIRequest(req.id, { cancelled: true });
 		}
 	});
@@ -679,6 +733,8 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
+						false,
+						ctx,
 					);
 					results.push(result);
 
@@ -756,6 +812,8 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 						makeDetails("parallel"),
+						false,
+						ctx,
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
