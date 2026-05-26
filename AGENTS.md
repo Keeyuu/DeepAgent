@@ -14,3 +14,4 @@
 - 子 agent 可用 `contact_supervisor` 汇报进度/请求决策；parent 可通过 steer/follow-up 控制运行中的 child。
 - 不读取、打印或修改 `C:\Users\Goni\.pi\agent\auth.json`。
 - 修改保持小范围；不做无关重构。
+- 文档入口：`docs/index.md`，专题分目录（`docs/architecture/`、`docs/plans/` 等）。
