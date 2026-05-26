@@ -219,6 +219,7 @@ const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+	keepAlive: Type.Optional(Type.Boolean({ description: "Keep this child session alive after completion for follow-up via action='resume'. Default: false.", default: false })),
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -233,12 +234,11 @@ const ActionSchema = StringEnum(["run", "resume", "release"] as const, {
 
 const SubagentParams = Type.Object({
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} to dispatch for action='run'." })),
-	async: Type.Optional(Type.Boolean({ description: "true (default) = return run IDs immediately. false = block until all tasks complete.", default: true })),
-	keepAlive: Type.Optional(Type.Boolean({ description: "Keep child sessions alive after completion for follow-up via action='resume'. Default: false.", default: false })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	action: Type.Optional(ActionSchema),
 	runId: Type.Optional(Type.String({ description: "Session runId for resume/release actions" })),
 	task: Type.Optional(Type.String({ description: "Task for resume action" })),
+	keepAlive: Type.Optional(Type.Boolean({ description: "Keep session alive after resume completion (for action='resume'). Default: false.", default: false })),
 	confirmProjectAgents: Type.Optional(Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true })),
 });
 
@@ -409,91 +409,7 @@ async function launchAgent(
 	};
 }
 
-/**
- * Run an already-started agent session to completion (blocking).
- * Wires onEvent/onUIRequest/onClose, awaits waitForIdle, returns full result.
- * If keepAlive, moves session to pool on agent_end.
- */
-async function runAgent(
-	session: RpcSession,
-	runInfo: AsyncRunInfo,
-	keepAlive: boolean = false,
-): Promise<SingleResult> {
-	let poolRunId: string | undefined;
 
-	// Wire up event accumulation
-	const unsubEvents = session.onEvent((event) => {
-		runInfo.events.push(event);
-		runInfo.unsubEvents = unsubEvents;
-		accumulateEvent(runInfo.accumulated, event);
-
-		if (event.type === "agent_end") {
-			runInfo.status = "completed";
-			if (keepAlive && session.getExitCode() === null) {
-				// Move session from registry to pool
-				unsubEvents();
-				removeRun(runInfo.id);
-				try {
-					poolRunId = addToPool(session, runInfo.agent, runInfo.agentSource, runInfo.accumulated.usage);
-				} catch {
-					// Pool full — stop session to avoid orphaned child process
-					session.stop().catch(() => {});
-					poolRunId = undefined;
-				}
-			}
-		}
-	});
-
-	// Framework UI requests from child.
-	session.onUIRequest((req) => {
-		const fireAndForgetMethods = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
-		if (fireAndForgetMethods.includes(req.method)) return;
-		runInfo.pendingDecision = {
-			requestId: req.id,
-			message: (req as Record<string, unknown>).message as string ?? (req as Record<string, unknown>).title as string ?? "Unknown request",
-			requestedAt: Date.now(),
-		};
-	});
-
-	// If process dies before agent_end (crash), clean up registry
-	const unsubClose = session.onClose((code) => {
-		if (runInfo.status === "running") {
-			runInfo.status = code === 0 ? "completed" : "failed";
-			unsubEvents();
-			unsubClose();
-		}
-	});
-
-	// Await completion
-	try {
-		await session.waitForIdle(subagentConfig.idleTimeoutMs);
-	} catch {
-		// Idle timeout or process crash
-	}
-
-	// Auto-cleanup: suppress when keepAlive (session moved to pool on agent_end)
-	if (!keepAlive) {
-		setTimeout(() => {
-			unsubEvents();
-			removeRun(runInfo.id);
-			session.stop().catch(() => {});
-		}, 60_000);
-	}
-
-	return {
-		agent: runInfo.agent,
-		agentSource: runInfo.agentSource,
-		task: runInfo.task,
-		exitCode: session.getExitCode() ?? (runInfo.status === "completed" ? 0 : 1),
-		messages: runInfo.accumulated.messages,
-		stderr: runInfo.accumulated.stderr,
-		usage: runInfo.accumulated.usage,
-		model: runInfo.accumulated.model ?? undefined,
-		stopReason: runInfo.accumulated.stopReason,
-		errorMessage: runInfo.accumulated.errorMessage,
-		runId: poolRunId,
-	};
-}
 
 // ── Extension entry point ──────────────────────────────────────────────────
 
@@ -562,7 +478,6 @@ export default function (pi: ExtensionAPI) {
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Provide a 'tasks' array of {agent, task} to dispatch.",
 			"async=true (default): returns run IDs immediately. Use subagent_status to track progress and get results.",
-			"async=false: blocks until all tasks complete, then returns full output.",
 			"Use keepAlive to keep sessions alive for follow-up via action='resume'.",
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
@@ -722,9 +637,6 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const isAsync = params.async ?? true;
-			const keepAlive = params.keepAlive ?? false;
-
 			// Project agent confirmation
 			if ((agentScope === "project" || agentScope === "both") && (params.confirmProjectAgents ?? true) && ctx.hasUI) {
 				const requestedAgentNames = new Set(tasks.map((t) => t.agent));
@@ -757,59 +669,17 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// Async mode: fire-and-forget
-			if (isAsync) {
-				const results = await mapWithConcurrencyLimit(tasks, MAX_CONCURRENCY, async (t) => {
-					return await launchAgent(ctx.cwd, agents, t.agent, t.task, t.cwd, signal, keepAlive);
-				});
-				const lines = results.map((r) => {
-					const runId = r.errorMessage?.match(/Run ID: ([\w-]+)/)?.[1] ?? "?";
-					return `- [${r.agent}] → ${runId}`;
-				});
-				return {
-					content: [{ type: "text", text: `Launched ${results.length} task(s). Use subagent_status to track.\n${lines.join("\n")}` }],
-					details: { agentScope, projectAgentsDir: discovery.projectAgentsDir, results },
-				};
-			}
-
-			// Sync mode: block until all complete
+			// Launch all tasks as async fire-and-forget
 			const results = await mapWithConcurrencyLimit(tasks, MAX_CONCURRENCY, async (t) => {
-				const agent = agents.find((a) => a.name === t.agent);
-				if (!agent) {
-					return {
-						agent: t.agent, agentSource: "unknown" as const, task: t.task, exitCode: 1,
-						messages: [], stderr: `Unknown agent: "${t.agent}". Available: ${agents.map(a => a.name).join(", ")}`,
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					};
-				}
-				const session = new RpcSession({
-					cwd: t.cwd ?? ctx.cwd,
-					env: { SUBAGENT_CHILD: "1", SUBAGENT_DEPTH: String(parseInt(process.env.SUBAGENT_DEPTH || "0", 10) + 1) },
-					model: agent.model, tools: agent.tools, systemPrompt: agent.systemPrompt, args: ["-p"],
-					childExtensionPath: path.join(ctx.cwd, ".pi", "extensions", "subagent", "index.ts"),
-				});
-				try { await session.start(); } catch (err: any) {
-					return {
-						agent: t.agent, agentSource: agent.source, task: t.task, exitCode: 1,
-						messages: [], stderr: `Failed to start: ${err.message}`,
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-					};
-				}
-				const runId = randomUUID();
-				const runInfo: AsyncRunInfo = {
-					id: runId, agent: t.agent, task: t.task, status: "running", session, events: [],
-					accumulated: { messages: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 }, stderr: "" },
-					startedAt: Date.now(), agentSource: agent.source,
-				};
-				registerRun(runInfo);
-				session.prompt(`Task: ${t.task}`);
-				return await runAgent(session, runInfo, keepAlive);
+				return await launchAgent(ctx.cwd, agents, t.agent, t.task, t.cwd, signal, t.keepAlive ?? false);
 			});
-
-			const lastPooled = results.find((r) => r.runId);
+			const lines = results.map((r) => {
+				const runId = r.errorMessage?.match(/Run ID: ([\w-]+)/)?.[1] ?? "?";
+				return `- [${r.agent}] → ${runId}`;
+			});
 			return {
-				content: [{ type: "text", text: results.map((r) => getFinalOutput(r.messages) || "(no output)").join("\n\n---\n\n") }],
-				details: { agentScope, projectAgentsDir: discovery.projectAgentsDir, results, runId: lastPooled?.runId },
+				content: [{ type: "text", text: `Launched ${results.length} task(s). Use subagent_status to track.\n${lines.join("\n")}` }],
+				details: { agentScope, projectAgentsDir: discovery.projectAgentsDir, results },
 			};
 		},
 
@@ -836,15 +706,13 @@ export default function (pi: ExtensionAPI) {
 
 			const scope: AgentScope = args.agentScope ?? "user";
 			const tasks = args.tasks;
-			const isAsync = args.async ?? true;
-			const keepAlive = args.keepAlive ?? false;
 
 			if (!tasks || tasks.length === 0) {
-				let text =
+				return new Text(
 					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("muted", "no tasks");
-				if (!isAsync) text += theme.fg("warning", " [sync]");
-				return new Text(text, 0, 0);
+					theme.fg("muted", "no tasks"),
+					0, 0,
+				);
 			}
 
 			if (tasks.length === 1) {
@@ -855,8 +723,7 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("accent", t.agent) +
 					theme.fg("muted", ` [${scope}]`);
 				text += `\n  ${theme.fg("dim", preview)}`;
-				if (!isAsync) text += theme.fg("warning", " [sync]");
-				if (keepAlive) text += theme.fg("muted", " [keep-alive]");
+				if (t.keepAlive) text += theme.fg("muted", " [keep-alive]");
 				return new Text(text, 0, 0);
 			}
 
@@ -870,8 +737,8 @@ export default function (pi: ExtensionAPI) {
 				text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
 			}
 			if (tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${tasks.length - 3} more`)}`;
-			if (!isAsync) text += theme.fg("warning", " [sync]");
-			if (keepAlive) text += theme.fg("muted", " [keep-alive]");
+			const hasKeepAlive = tasks.some((t: any) => t.keepAlive);
+			if (hasKeepAlive) text += theme.fg("muted", " [keep-alive]");
 			return new Text(text, 0, 0);
 		},
 
