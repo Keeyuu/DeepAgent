@@ -19,18 +19,22 @@ import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-a
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { discoverAgents } from "./agents.ts";
-import { accumulateResultFromEvents, getFinalOutput } from "./event-accumulator.ts";
+import { randomUUID } from "node:crypto";
+import { accumulateResultFromEvents, accumulateEvent, getFinalOutput } from "./event-accumulator.ts";
 import type {
 	AgentConfig,
 	AgentScope,
+	AsyncRunInfo,
 	DisplayItem,
 	OnUpdateCallback,
 	RpcEvent,
+	RunStatus,
 	SingleResult,
 	SubagentDetails,
 	UsageStats,
 } from "./types.ts";
 import { RpcSession } from "./rpc-session.ts";
+import { registerRun, getRun, removeRun, getActiveRunCount, getAllRuns } from "./run-registry.ts";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -248,6 +252,7 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	async: Type.Optional(Type.Boolean({ description: "Run in background. Returns run ID immediately. Use subagent_steer/status/abort to interact. Only for single mode.", default: false })),
 });
 
 const ContactSupervisorParams = Type.Object({
@@ -269,6 +274,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	asyncMode: boolean = false,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -326,6 +332,88 @@ async function runSingleAgent(
 			...currentResult,
 			exitCode: 1,
 			stderr: `Failed to start RPC session: ${err.message}`,
+		};
+	}
+
+	// ── Async mode: register run and return immediately ──
+	if (asyncMode) {
+		const runId = randomUUID();
+		const runInfo: AsyncRunInfo = {
+			id: runId,
+			agent: agentName,
+			task,
+			status: "running",
+			session,
+			events: [],
+			accumulated: {
+				messages: [],
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				stderr: "",
+			},
+			startedAt: Date.now(),
+			agentSource: agent.source,
+		};
+
+		// Wire up background event accumulation
+		session.onEvent((event) => {
+			runInfo.events.push(event);
+			accumulateEvent(runInfo.accumulated, event);
+
+			if (event.type === "agent_end") {
+				runInfo.status = "completed";
+				// Auto-cleanup after delay to allow status queries
+				setTimeout(() => {
+					removeRun(runId);
+					session.stop().catch(() => {});
+				}, 60_000);
+			}
+		});
+
+		// Handle UI requests in background (auto-respond with defaults)
+		session.onUIRequest((req) => {
+			const fireAndForget = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
+			if (fireAndForget.includes(req.method)) return;
+			if (req.method === "confirm") session.respondToUIRequest(req.id, { confirmed: true });
+			else if (req.method === "input") session.respondToUIRequest(req.id, { value: String(req.default_value ?? "") });
+			else if (req.method === "select") {
+				const opts = req.options as string[] | undefined;
+				session.respondToUIRequest(req.id, { value: opts?.[0] ?? "" });
+			} else if (req.method === "editor") session.respondToUIRequest(req.id, { value: String(req.prefill ?? "") });
+			else session.respondToUIRequest(req.id, { cancelled: true });
+		});
+
+		// Wire abort signal
+		if (signal) {
+			const killSession = async () => {
+				runInfo.status = "aborted";
+				try { session.abort(); } catch { /* ignore */ }
+				setTimeout(() => {
+					removeRun(runId);
+					session.stop().catch(() => {});
+				}, 1000);
+			};
+			if (signal.aborted) killSession();
+			else signal.addEventListener("abort", killSession, { once: true });
+		}
+
+		// Register the run
+		registerRun(runInfo);
+
+		// Send the task prompt
+		session.prompt(`Task: ${task}`);
+
+		// Return immediately with run ID
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			exitCode: -1,
+			messages: [],
+			stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			model: agent.model,
+			step,
+			errorMessage: `Async run started. Run ID: ${runId}`,
 		};
 	}
 
@@ -695,6 +783,15 @@ export default function (pi: ExtensionAPI) {
 
 			// ── Single mode ──
 			if (params.agent && params.task) {
+				const isAsync = params.async ?? false;
+
+				if (isAsync && (hasChain || hasTasks)) {
+					return {
+						content: [{ type: "text", text: "Async mode is only supported for single task mode (agent + task)." }],
+						details: makeDetails("single")([]),
+					};
+				}
+
 				const result = await runSingleAgent(
 					ctx.cwd,
 					agents,
@@ -705,7 +802,16 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					onUpdate,
 					makeDetails("single"),
+					isAsync,
 				);
+
+				if (isAsync) {
+					return {
+						content: [{ type: "text", text: result.errorMessage || "Async run started." }],
+						details: makeDetails("single")([result]),
+					};
+				}
+
 				const isError = isFailedResult(result);
 				if (isError) {
 					const errorMsg = getResultOutput(result);
@@ -1038,18 +1144,184 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ── Register subagent_steer tool ──
+	pi.registerTool({
+		name: "subagent_steer",
+		label: "Subagent Steer",
+		description: "Send a steering message to a running async subagent. The message modifies the agent's current behavior without ending its turn.",
+		parameters: Type.Object({
+			runId: Type.String({ description: "The run ID returned by the async subagent call" }),
+			message: Type.String({ description: "The steering message to send to the running agent" }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult<undefined>> {
+			const run = getRun(params.runId);
+			if (!run) {
+				return {
+					content: [{ type: "text", text: `No active run with ID: ${params.runId}` }],
+					details: undefined,
+				};
+			}
+			if (run.status !== "running") {
+				return {
+					content: [{ type: "text", text: `Run ${params.runId} is not running (status: ${run.status})` }],
+					details: undefined,
+				};
+			}
+
+			const session = run.session as RpcSession;
+			try {
+				session.steer(params.message);
+			} catch (err: any) {
+				return {
+					content: [{ type: "text", text: `Failed to steer: ${err.message}` }],
+					details: undefined,
+				};
+			}
+
+			return {
+				content: [{ type: "text", text: `Steering message sent to run ${params.runId}` }],
+				details: undefined,
+			};
+		},
+	});
+
+	// ── Register subagent_status tool ──
+	pi.registerTool({
+		name: "subagent_status",
+		label: "Subagent Status",
+		description: "Check the status of an async subagent run. Returns current progress, accumulated output, and usage stats. If no runId specified, lists all active runs.",
+		parameters: Type.Object({
+			runId: Type.Optional(Type.String({ description: "The run ID to check. If omitted, lists all active runs." })),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult<undefined>> {
+			if (!params.runId) {
+				const runs = getAllRuns();
+				if (runs.length === 0) {
+					return {
+						content: [{ type: "text", text: "No active async subagent runs." }],
+						details: undefined,
+					};
+				}
+				const lines = runs.map((r) => {
+					const elapsed = Math.round((Date.now() - r.startedAt) / 1000);
+					const output = getFinalOutput(r.accumulated.messages);
+					const preview = output.length > 80 ? `${output.slice(0, 80)}...` : output || "(no output yet)";
+					return `- ${r.id}: [${r.status}] ${r.agent} "${r.task}" (${elapsed}s)\n  ${preview}`;
+				});
+				return {
+					content: [{ type: "text", text: `Active runs (${runs.length}):\n${lines.join("\n")}` }],
+					details: undefined,
+				};
+			}
+
+			const run = getRun(params.runId);
+			if (!run) {
+				return {
+					content: [{ type: "text", text: `No run found with ID: ${params.runId}. It may have completed and been cleaned up.` }],
+					details: undefined,
+				};
+			}
+
+			const elapsed = Math.round((Date.now() - run.startedAt) / 1000);
+			const output = getFinalOutput(run.accumulated.messages);
+			const usage = run.accumulated.usage;
+
+			const parts = [
+				`Run: ${run.id}`,
+				`Agent: ${run.agent} (${run.agentSource})`,
+				`Task: ${run.task}`,
+				`Status: ${run.status}`,
+				`Elapsed: ${elapsed}s`,
+				`Turns: ${usage.turns}`,
+			];
+
+			if (usage.input || usage.output) {
+				parts.push(`Tokens: ↑${usage.input} ↓${usage.output}`);
+			}
+			if (usage.cost) {
+				parts.push(`Cost: $${usage.cost.toFixed(4)}`);
+			}
+			if (run.accumulated.model) {
+				parts.push(`Model: ${run.accumulated.model}`);
+			}
+			if (run.accumulated.stopReason) {
+				parts.push(`Stop: ${run.accumulated.stopReason}`);
+			}
+			if (run.accumulated.errorMessage) {
+				parts.push(`Error: ${run.accumulated.errorMessage}`);
+			}
+			if (run.lastError) {
+				parts.push(`LastError: ${run.lastError}`);
+			}
+			if (output) {
+				parts.push(`\nOutput:\n${output}`);
+			}
+
+			return {
+				content: [{ type: "text", text: parts.join("\n") }],
+				details: undefined,
+			};
+		},
+	});
+
+	// ── Register subagent_abort tool ──
+	pi.registerTool({
+		name: "subagent_abort",
+		label: "Subagent Abort",
+		description: "Abort a running async subagent. Sends abort to the child process and removes it from the active runs registry.",
+		parameters: Type.Object({
+			runId: Type.String({ description: "The run ID to abort" }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult<undefined>> {
+			const run = getRun(params.runId);
+			if (!run) {
+				return {
+					content: [{ type: "text", text: `No active run with ID: ${params.runId}` }],
+					details: undefined,
+				};
+			}
+			if (run.status !== "running") {
+				return {
+					content: [{ type: "text", text: `Run ${params.runId} is not running (status: ${run.status})` }],
+					details: undefined,
+				};
+			}
+
+			run.status = "aborted";
+			const session = run.session as RpcSession;
+
+			// Remove from registry first
+			removeRun(params.runId);
+
+			// Graceful abort then force stop
+			try { session.abort(); } catch { /* ignore */ }
+			try { await session.stop(); } catch { /* ignore */ }
+
+			return {
+				content: [{ type: "text", text: `Run ${params.runId} aborted and cleaned up.` }],
+				details: undefined,
+			};
+		},
+	});
+
 	// Register the `/doctor` command
 	pi.registerCommand("doctor", {
 		description: "Check subagent extension status",
 		async handler(_args, ctx) {
 			const discovery = discoverAgents(ctx.cwd, "both");
 			const agentList = discovery.agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+			const activeAsyncRuns = getActiveRunCount();
 
 			const lines = [
 				"Subagent Extension",
 				"extension: loaded",
 				`agents: ${agentList}`,
 				"transport: rpc (--mode rpc)",
+				`active async runs: ${activeAsyncRuns}`,
+				`config: idleTimeoutMs=${subagentConfig.idleTimeoutMs}`,
 			];
 
 			ctx.ui.notify(lines.join("\n"), "info");
