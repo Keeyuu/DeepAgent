@@ -1,0 +1,27 @@
+# DeepAgent Project Instructions
+
+- 默认中文沟通，简洁、直接、证据优先。
+- 本项目 V1 只走一条路线：基于 `earendil-works/pi` 官方能力构建最小 DeepAgent。
+- 官方实现基线：
+  - https://pi.dev/docs/latest
+  - https://pi.dev/docs/latest/extensions
+  - https://pi.dev/docs/latest/settings
+  - https://pi.dev/docs/latest/prompt-templates
+  - https://pi.dev/docs/latest/skills
+  - https://pi.dev/docs/latest/json
+  - https://github.com/earendil-works/pi
+  - `C:\Code\pi-learn\pi` (`/c/Code/pi-learn/pi`)
+  - `C:\Code\pi-learn\pi\packages\coding-agent\examples\extensions\subagent`
+- 非官方参考只允许借鉴，不作为 V1 依赖或运行时：
+  - `C:\Code\pi-learn\pi-subagents`
+  - `C:\Code\pi-learn\oh-my-pi`
+  - `C:\Code\pi-learn\oh-my-opencode-slim`
+  - `C:\Code\pi-learn\opencode-dynamic-context-pruning`
+- V1 不安装或依赖 `pi-subagents`、`pi-intercom`、`pi-agents`、`pi-crew`、`pi-multiagent`、`pi-sub-agent` 等第三方编排 runtime。
+- V1 不引入 SDK/RPC 自定义宿主、MCP 聚合默认链路、Web access 默认 researcher、worktree 编排、async runs、chain/parallel workflow、review-loop 或 agent catalog。
+- 项目装配优先使用 `.pi/settings.json`、`.pi/prompts/`、`.pi/skills/`、`.pi/extensions/` 和官方 extension API。
+- 命名规范：工具、命令、目录、prompt、skill、env var 使用语义名；不要加无意义 `deepagent` / `DeepAgent` 前缀。只有项目名、package name、README 标题这类对象本身是 DeepAgent 时才使用。示例：tool `subagent`，extension `subagent`，skill `subagent`，diagnostic command `/doctor`，env `SUBAGENT_CHILD`。
+- 本项目只负责项目提示词、一个最小项目 agent、一个最小 child Pi process 委托工具、安全门、验证说明和文档。
+- 子 agent 遇到需要主脑或用户决策的问题，返回 `status: need_decision`；V1 不做实时 child-to-parent 通讯。
+- 不读取、打印或修改 `C:\Users\Goni\.pi\agent\auth.json`。
+- 修改保持小范围；不要迁移无关配置，不做无关重构。
