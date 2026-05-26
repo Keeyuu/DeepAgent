@@ -37,7 +37,7 @@ export interface RpcSessionOptions {
 export interface ExtensionUIRequest {
   id: string;
   method: string;
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 type EventListener = (event: RpcEvent) => void;

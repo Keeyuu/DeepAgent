@@ -24,6 +24,7 @@ import type {
 	AgentScope,
 	DisplayItem,
 	OnUpdateCallback,
+	RpcEvent,
 	SingleResult,
 	SubagentDetails,
 	UsageStats,
@@ -131,7 +132,7 @@ function formatToolCall(
 
 // ── Display helpers ─────────────────────────────────────────────────────────
 
-function getDisplayItems(messages: any[]): DisplayItem[] {
+function getDisplayItems(messages: Message[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
 	for (const msg of messages) {
 		if (msg.role === "assistant") {
@@ -310,11 +311,12 @@ async function runSingleAgent(
 		if (req.method === "confirm") {
 			session.respondToUIRequest(req.id, { confirmed: true });
 		} else if (req.method === "input") {
-			session.respondToUIRequest(req.id, { value: req.default_value || "" });
+			session.respondToUIRequest(req.id, { value: String(req.default_value ?? "") });
 		} else if (req.method === "select") {
-			session.respondToUIRequest(req.id, { value: req.options?.[0] || "" });
+			const opts = req.options as string[] | undefined;
+			session.respondToUIRequest(req.id, { value: opts?.[0] ?? "" });
 		} else if (req.method === "editor") {
-			session.respondToUIRequest(req.id, { value: req.prefill || "" });
+			session.respondToUIRequest(req.id, { value: String(req.prefill ?? "") });
 		} else {
 			// Unknown method: cancel
 			session.respondToUIRequest(req.id, { cancelled: true });
@@ -322,7 +324,7 @@ async function runSingleAgent(
 	});
 
 	// Track events for accumulation
-	const events: any[] = [];
+	const events: RpcEvent[] = [];
 	const eventUnsubscribe = session.onEvent((event) => {
 		events.push(event);
 		// Emit streaming updates

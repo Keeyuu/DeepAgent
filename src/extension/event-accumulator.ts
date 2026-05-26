@@ -5,7 +5,7 @@
  * Testable without any process or RPC mocking.
  */
 
-import type { AccumulatedResult, UsageStats, RpcEvent } from "./types.ts";
+import type { AccumulatedResult, UsageStats, RpcEvent, Message } from "./types.ts";
 
 /** Create an empty accumulated result */
 function emptyResult(): AccumulatedResult {
@@ -16,14 +16,24 @@ function emptyResult(): AccumulatedResult {
   };
 }
 
+/** Minimal usage shape expected from Pi message events */
+interface PiUsage {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  cost?: number | { total?: number; input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+  contextTokens?: number;
+}
+
 /** Add usage from a message's usage field into the accumulator */
-function accumulateUsage(usage: UsageStats, msgUsage: any): void {
+function accumulateUsage(usage: UsageStats, msgUsage: PiUsage | undefined): void {
   if (!msgUsage) return;
   usage.input += msgUsage.input ?? 0;
   usage.output += msgUsage.output ?? 0;
   usage.cacheRead += msgUsage.cacheRead ?? 0;
   usage.cacheWrite += msgUsage.cacheWrite ?? 0;
-  usage.cost += msgUsage.cost ?? 0;
+  usage.cost += typeof msgUsage.cost === "number" ? msgUsage.cost : (msgUsage.cost as { total?: number })?.total ?? 0;
   usage.contextTokens += msgUsage.contextTokens ?? 0;
 }
 
@@ -34,16 +44,17 @@ function accumulateUsage(usage: UsageStats, msgUsage: any): void {
 export function accumulateEvent(result: AccumulatedResult, event: RpcEvent): AccumulatedResult {
   switch (event.type) {
     case "message_end": {
-      if (event.message) {
-        result.messages.push(event.message);
+      const msg = (event as { type: "message_end"; message?: Message }).message;
+      if (msg) {
+        result.messages.push(msg);
 
         // Accumulate usage and metadata from assistant messages
-        if (event.message.role === "assistant") {
+        if (msg.role === "assistant") {
           result.usage.turns++;
-          accumulateUsage(result.usage, event.message.usage);
-          if (event.message.model) result.model = event.message.model;
-          if (event.message.stopReason) result.stopReason = event.message.stopReason;
-          if (event.message.errorMessage) result.errorMessage = event.message.errorMessage;
+          accumulateUsage(result.usage, msg.usage);
+          if (msg.model) result.model = msg.model;
+          if (msg.stopReason) result.stopReason = msg.stopReason;
+          if (msg.errorMessage) result.errorMessage = msg.errorMessage;
         }
       }
       break;
@@ -63,9 +74,7 @@ export function accumulateEvent(result: AccumulatedResult, event: RpcEvent): Acc
 
     case "agent_end": {
       // Terminal event. agent_end may carry final messages array.
-      if (event.messages && Array.isArray(event.messages)) {
-        // Don't overwrite — messages already accumulated via message_end events
-      }
+      // Don't overwrite — messages already accumulated via message_end events
       break;
     }
 
@@ -100,7 +109,7 @@ export function accumulateResultFromEvents(events: RpcEvent[]): AccumulatedResul
  * Get the last assistant text from accumulated messages.
  * Mirrors official demo's getFinalOutput().
  */
-export function getFinalOutput(messages: any[]): string {
+export function getFinalOutput(messages: Message[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg.role === "assistant" && Array.isArray(msg.content)) {

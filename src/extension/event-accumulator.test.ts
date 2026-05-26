@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { accumulateResultFromEvents, accumulateEvent, getFinalOutput } from "./event-accumulator.ts";
-import type { RpcEvent } from "./types.ts";
+import type { Message, RpcEvent } from "./types.ts";
 
 describe("accumulateResultFromEvents", () => {
   it("returns empty result for no events", () => {
@@ -177,18 +177,18 @@ describe("accumulateEvent", () => {
 describe("getFinalOutput", () => {
   it("returns last assistant text", () => {
     const messages = [
-      { role: "user", content: [{ type: "text", text: "hello" }] },
-      { role: "assistant", content: [{ type: "text", text: "first" }] },
-      { role: "assistant", content: [{ type: "text", text: "last" }] },
-    ];
+      { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 0 },
+      { role: "assistant", content: [{ type: "text", text: "first" }], api: "anthropic-messages", provider: "glm", model: "glm-5.1", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 },
+      { role: "assistant", content: [{ type: "text", text: "last" }], api: "anthropic-messages", provider: "glm", model: "glm-5.1", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 },
+    ] as Message[];
 
     expect(getFinalOutput(messages)).toBe("last");
   });
 
   it("returns empty string when no assistant messages", () => {
     const messages = [
-      { role: "user", content: [{ type: "text", text: "hello" }] },
-    ];
+      { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 0 },
+    ] as Message[];
 
     expect(getFinalOutput(messages)).toBe("");
   });
@@ -199,9 +199,9 @@ describe("getFinalOutput", () => {
 
   it("skips assistant messages with no text content", () => {
     const messages = [
-      { role: "assistant", content: [{ type: "tool_use", name: "bash" }] },
-      { role: "assistant", content: [{ type: "text", text: "fallback" }] },
-    ];
+      { role: "assistant", content: [{ type: "tool_use", name: "bash" }], api: "anthropic-messages", provider: "glm", model: "glm-5.1", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 },
+      { role: "assistant", content: [{ type: "text", text: "fallback" }], api: "anthropic-messages", provider: "glm", model: "glm-5.1", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 0 },
+    ] as Message[];
 
     expect(getFinalOutput(messages)).toBe("fallback");
   });

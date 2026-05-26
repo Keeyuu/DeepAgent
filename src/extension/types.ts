@@ -3,6 +3,11 @@
  * Aligned with the official Pi subagent demo's types.
  */
 
+import type { Message } from "@earendil-works/pi-ai";
+export type { Message };
+import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
+export type { AgentToolResult };
+
 /** Agent configuration loaded from .pi/agents/*.md */
 export interface AgentConfig {
   name: string;
@@ -36,7 +41,7 @@ export interface SingleResult {
   agentSource: "user" | "project" | "unknown";
   task: string;
   exitCode: number;
-  messages: any[];
+  messages: Message[];
   stderr: string;
   usage: UsageStats;
   model?: string;
@@ -57,14 +62,14 @@ export interface SubagentDetails {
 export type AgentScope = "user" | "project" | "both";
 
 /** Callback for streaming updates during agent execution */
-export type OnUpdateCallback = (partial: any) => void;
+export type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 /**
  * Accumulated result from RPC event stream parsing.
  * Internal representation before conversion to SingleResult.
  */
 export interface AccumulatedResult {
-  messages: any[];
+  messages: Message[];
   usage: UsageStats;
   model?: string;
   stopReason?: string;
@@ -77,14 +82,14 @@ export interface AccumulatedResult {
  * Three categories: responses, agent events, and extension UI requests.
  */
 export type RpcEvent =
-  | { type: "response"; command: string; success: boolean; data?: any; error?: string; id?: string }
+  | { type: "response"; command: string; success: boolean; data?: unknown; error?: string; id?: string }
   | { type: "agent_start" }
-  | { type: "agent_end"; messages?: any[]; willRetry?: boolean }
-  | { type: "message_start"; message?: any }
-  | { type: "message_update"; message?: any; assistantMessageEvent?: any }
-  | { type: "message_end"; message?: any }
+  | { type: "agent_end"; messages?: Message[]; willRetry?: boolean }
+  | { type: "message_start"; message?: Message }
+  | { type: "message_update"; message?: Message; assistantMessageEvent?: Record<string, unknown> }
+  | { type: "message_end"; message?: Message }
   | { type: "tool_execution_start"; toolCallId?: string; toolName?: string; args?: string }
   | { type: "tool_execution_update"; toolCallId?: string; toolName?: string; args?: string; partialResult?: string }
   | { type: "tool_execution_end"; toolCallId?: string; toolName?: string; result?: string; isError?: boolean }
-  | { type: "extension_ui_request"; id: string; method: string; [key: string]: any }
-  | { type: string; [key: string]: any }; // fallback for unknown events
+  | { type: "extension_ui_request"; id: string; method: string; [key: string]: unknown }
+  | { type: string; [key: string]: unknown }; // fallback for unknown events
