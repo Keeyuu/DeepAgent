@@ -311,29 +311,44 @@ export class RpcSession {
   }
 
   /**
-   * Wait for agent_end event with optional timeout.
-   * Returns all collected events.
+   * Wait for agent_end event with idle heartbeat timeout.
+   *
+   * The child process can run indefinitely as long as it keeps producing
+   * events (message_update, tool_execution_start/end, etc.). Only if no
+   * event arrives within idleTimeoutMs is the session considered stuck.
+   *
+   * @param idleTimeoutMs Max ms between events before timing out (default 5 min)
+   * @returns All events collected during the wait
    */
-  waitForIdle(timeoutMs = 300_000): Promise<RpcEvent[]> {
+  waitForIdle(idleTimeoutMs = 300_000): Promise<RpcEvent[]> {
     return new Promise((resolve, reject) => {
       const events: RpcEvent[] = [];
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const resetIdleTimer = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`Session idle for ${idleTimeoutMs}ms — no events received from child process`));
+        }, idleTimeoutMs);
+      };
+
       const unsubscribe = this.onEvent((event) => {
         events.push(event);
+        resetIdleTimer();
         if (event.type === "agent_end") {
           cleanup();
           resolve(events);
         }
       });
 
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error(`waitForIdle timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-
       const cleanup = () => {
         unsubscribe();
-        clearTimeout(timer);
+        if (idleTimer) clearTimeout(idleTimer);
       };
+
+      // Start idle timer
+      resetIdleTimer();
     });
   }
 

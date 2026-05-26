@@ -356,11 +356,11 @@ async function runSingleAgent(
 	// Send the task as a prompt
 	session.prompt(`Task: ${task}`);
 
-	// Wait for agent to finish
+	// Wait for agent to finish (idle heartbeat: 5 min with no event = stuck)
 	try {
 		await session.waitForIdle(300_000);
 	} catch (err: any) {
-		// Timeout or error
+		// Idle timeout — child stopped producing events
 		currentResult.exitCode = 1;
 		currentResult.stderr = err.message;
 	} finally {
