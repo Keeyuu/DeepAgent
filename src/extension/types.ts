@@ -48,6 +48,7 @@ export interface SingleResult {
   stopReason?: string;
   errorMessage?: string;
   step?: number;
+  runId?: string; // present when session is pooled (keepAlive)
 }
 
 /** Details payload for the tool result (supports single/parallel/chain) */
@@ -56,6 +57,7 @@ export interface SubagentDetails {
   agentScope: AgentScope;
   projectAgentsDir: string | null;
   results: SingleResult[];
+  runId?: string; // present when keepAlive: true or action: "resume"
 }
 
 /** Agent discovery scope */

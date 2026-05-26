@@ -24,8 +24,10 @@ import { accumulateEvent, getFinalOutput } from "./event-accumulator.ts";
 import type {
 	AgentConfig,
 	AgentScope,
+	AccumulatedResult,
 	AsyncRunInfo,
 	DisplayItem,
+	OnUpdateCallback,
 	RpcEvent,
 	RunStatus,
 	SingleResult,
@@ -34,6 +36,7 @@ import type {
 } from "./types.ts";
 import { RpcSession } from "./rpc-session.ts";
 import { registerRun, getRun, removeRun, getActiveRunCount, getAllRuns } from "./run-registry.ts";
+import { addToPool, getFromPool, removeFromPool, updatePoolActivity, getPoolRunIds, getPoolSize, registerExitHandlers, MAX_TOTAL_CHILDREN } from "./session-pool.ts";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -232,12 +235,25 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	default: "user",
 });
 
+const ActionSchema = StringEnum(["run", "resume", "release"] as const, {
+	description: "Action to perform. 'run': new task (default). 'resume': send follow-up to idle session. 'release': destroy idle session.",
+	default: "run",
+});
+
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
+	action: Type.Optional(ActionSchema),
+	runId: Type.Optional(Type.String({ description: "Session runId for resume/release actions" })),
+	keepAlive: Type.Optional(
+		Type.Boolean({
+			description: "Keep the child session alive after task completion for follow-up via action='resume'. Chain mode only. Default: false.",
+			default: false,
+		}),
+	),
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
@@ -253,9 +269,12 @@ const ContactSupervisorParams = Type.Object({
 // ── RPC-based agent runner ──────────────────────────────────────────────────
 
 /**
- * Run a single agent via RPC session. Always fire-and-forget:
- * registers the run and returns immediately with the run ID.
- * Use subagent_status / subagent_respond / subagent_abort to interact.
+ * Run a single agent via RPC session.
+ *
+ * Single mode: fire-and-forget — registers the run and returns immediately with the run ID.
+ * Chain mode (keepAlive=true): waits for completion, optionally pools the session.
+ *
+ * Use subagent_status / subagent_respond / subagent_abort to interact with async runs.
  */
 async function runSingleAgent(
 	defaultCwd: string,
@@ -265,6 +284,10 @@ async function runSingleAgent(
 	cwd: string | undefined,
 	step: number | undefined,
 	signal: AbortSignal | undefined,
+	onUpdate?: OnUpdateCallback,
+	makeDetails?: (results: SingleResult[]) => SubagentDetails,
+	fireAndForget: boolean = true,
+	keepAlive: boolean = false,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -328,25 +351,53 @@ async function runSingleAgent(
 		agentSource: agent.source,
 	};
 
+	let poolRunId: string | undefined;
+
 	// Wire up event accumulation
-	session.onEvent((event) => {
+	const unsubEvents = session.onEvent((event) => {
 		runInfo.events.push(event);
 		accumulateEvent(runInfo.accumulated, event);
 
+		// Streaming updates for chain/wait mode
+		if (onUpdate && makeDetails) {
+			const currentResult: SingleResult = {
+				agent: agentName,
+				agentSource: agent.source,
+				task,
+				exitCode: runInfo.accumulated.usage.turns > 0 ? EXIT_CODE_PENDING : EXIT_CODE_PENDING,
+				messages: runInfo.accumulated.messages,
+				stderr: runInfo.accumulated.stderr,
+				usage: runInfo.accumulated.usage,
+				model: runInfo.accumulated.model,
+				stopReason: runInfo.accumulated.stopReason,
+				errorMessage: runInfo.accumulated.errorMessage,
+				step,
+			};
+			onUpdate({
+				content: [{ type: "text", text: getFinalOutput(runInfo.accumulated.messages) || "(running...)" }],
+				details: makeDetails([currentResult]),
+			});
+		}
+
 		if (event.type === "agent_end") {
 			runInfo.status = "completed";
-			// Auto-cleanup after delay to allow status queries
-			setTimeout(() => {
+			// keepAlive: move session from registry to pool
+			if (keepAlive && !fireAndForget && session.getExitCode() === null) {
+				unsubEvents();
 				removeRun(runId);
-				session.stop().catch(() => {});
-			}, 60_000);
+				try {
+					poolRunId = addToPool(session, agentName, agent.source, runInfo.accumulated.usage);
+				} catch {
+					// Pool full — fall through to normal cleanup
+					poolRunId = undefined;
+				}
+			}
 		}
 	});
 
 	// Framework UI requests from child.
 	// contact_supervisor(decision) uses ctx.ui.input() → triggers extension_ui_request.
 	// Store as pending decision so parent LLM can respond via subagent_respond.
-	// No timeout: parent agent decides when to respond (may need time to gather info).
 	session.onUIRequest((req) => {
 		const fireAndForgetMethods = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
 		if (fireAndForgetMethods.includes(req.method)) return;
@@ -374,17 +425,51 @@ async function runSingleAgent(
 	registerRun(runInfo);
 	session.prompt(`Task: ${task}`);
 
+	// ── Fire-and-forget mode (single) ──
+	if (fireAndForget) {
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			exitCode: EXIT_CODE_PENDING,
+			messages: [],
+			stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			model: agent.model,
+			step,
+			errorMessage: `Async run started. Run ID: ${runId}`,
+		};
+	}
+
+	// ── Wait mode (chain with keepAlive) ──
+	try {
+		await session.waitForIdle(subagentConfig.idleTimeoutMs);
+	} catch (err: any) {
+		// Idle timeout or process crash
+	}
+
+	// Auto-cleanup: suppress when keepAlive (session moved to pool on agent_end)
+	if (!keepAlive) {
+		setTimeout(() => {
+			unsubEvents();
+			removeRun(runId);
+			session.stop().catch(() => {});
+		}, 60_000);
+	}
+
 	return {
 		agent: agentName,
 		agentSource: agent.source,
 		task,
-		exitCode: EXIT_CODE_PENDING,
-		messages: [],
-		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		exitCode: session.getExitCode() ?? (runInfo.status === "completed" ? 0 : 1),
+		messages: runInfo.accumulated.messages,
+		stderr: runInfo.accumulated.stderr,
+		usage: runInfo.accumulated.usage,
+		model: runInfo.accumulated.model ?? agent.model,
+		stopReason: runInfo.accumulated.stopReason,
+		errorMessage: runInfo.accumulated.errorMessage,
 		step,
-		errorMessage: `Async run started. Run ID: ${runId}`,
+		runId: poolRunId,
 	};
 }
 
@@ -395,6 +480,7 @@ export default function (pi: ExtensionAPI) {
 	if (process.env.SUBAGENT_CHILD !== "1") {
 		// pi.cwd is available via the API but not typed — use process.cwd() fallback
 		subagentConfig = readSubagentConfig(process.cwd());
+		registerExitHandlers();
 	}
 
 	// ── CHILD MODE: register contact_supervisor only ──
@@ -460,7 +546,113 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		parameters: SubagentParams,
 
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const action = params.action ?? "run";
+
+			// Helper for simple text results
+			const simpleResult = (text: string, isError = false) => ({
+				content: [{ type: "text" as const, text }],
+				details: undefined as SubagentDetails | undefined,
+				...(isError ? { isError: true as const } : {}),
+			});
+
+			// ── RELEASE action ──
+			if (action === "release") {
+				if (!params.runId) return simpleResult("runId is required for release action.", true);
+				const pooled = getFromPool(params.runId);
+				if (!pooled) return simpleResult(`No active session with runId "${params.runId}". Available: ${getPoolRunIds().join(", ") || "none"}`, true);
+				await pooled.session.stop().catch(() => {});
+				removeFromPool(params.runId);
+				return simpleResult(`Session ${params.runId} released.`);
+			}
+
+			// ── RESUME action ──
+			if (action === "resume") {
+				if (!params.runId) return simpleResult("runId is required for resume action.", true);
+				if (!params.task) return simpleResult("task is required for resume action.", true);
+				const pooled = getFromPool(params.runId);
+				if (!pooled) return simpleResult(`No active session with runId "${params.runId}". Available: ${getPoolRunIds().join(", ") || "none"}`, true);
+
+				pooled.lastActivityAt = Date.now();
+
+				const accumulated: AccumulatedResult = {
+					messages: [],
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+					stderr: "",
+				};
+
+				const currentResult: SingleResult = {
+					agent: pooled.agent,
+					agentSource: pooled.agentSource,
+					task: params.task,
+					exitCode: 0,
+					messages: [],
+					stderr: "",
+					usage: { ...pooled.usage },
+				};
+
+				const agentScope: AgentScope = params.agentScope ?? "user";
+				const makeResumeDetails = (results: SingleResult[]): SubagentDetails => ({
+					mode: "single",
+					agentScope,
+					projectAgentsDir: null,
+					results,
+					runId: pooled.runId,
+				});
+
+				const unsubResume = pooled.session.onEvent((event) => {
+					accumulateEvent(accumulated, event);
+					if (onUpdate) {
+						onUpdate({
+							content: [{ type: "text", text: getFinalOutput(accumulated.messages) || "(running...)" }],
+							details: makeResumeDetails([{
+								...currentResult,
+								messages: accumulated.messages,
+								usage: accumulated.usage,
+								model: accumulated.model,
+							}]),
+						});
+					}
+					if (event.type === "agent_end") {
+						currentResult.exitCode = pooled.session.getExitCode() ?? 0;
+					}
+				});
+
+				pooled.session.followUp(`Task: ${params.task}`);
+
+				try {
+					await pooled.session.waitForIdle(subagentConfig.idleTimeoutMs);
+				} catch (err: any) {
+					currentResult.exitCode = 1;
+					currentResult.stderr = err.message;
+				} finally {
+					unsubResume();
+				}
+
+				currentResult.messages = accumulated.messages;
+				currentResult.usage = accumulated.usage;
+				currentResult.model = accumulated.model ?? currentResult.model;
+				currentResult.stopReason = accumulated.stopReason ?? currentResult.stopReason;
+				currentResult.errorMessage = accumulated.errorMessage ?? currentResult.errorMessage;
+
+				if (params.keepAlive && currentResult.exitCode === 0) {
+					updatePoolActivity(pooled.runId, currentResult.usage);
+					currentResult.runId = pooled.runId;
+					return {
+						content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(no output)" }],
+						details: makeResumeDetails([currentResult]),
+					};
+				}
+
+				await pooled.session.stop().catch(() => {});
+				removeFromPool(pooled.runId);
+				return {
+					content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(no output)" }],
+					details: makeResumeDetails([currentResult]),
+				};
+			}
+
+			// ── RUN action (default) ──
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
@@ -524,6 +716,7 @@ export default function (pi: ExtensionAPI) {
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
+					const isLastStep = i === params.chain.length - 1;
 					// {previous} is left as-is; chain orchestration (sequential deps) is a future phase
 					const result = await runSingleAgent(
 						ctx.cwd,
@@ -533,17 +726,21 @@ export default function (pi: ExtensionAPI) {
 						step.cwd,
 						i + 1,
 						signal,
+						isLastStep ? onUpdate : undefined,
+						isLastStep ? makeDetails("chain") : undefined,
+						false, // fireAndForget
+						isLastStep && (params.keepAlive ?? false), // keepAlive only on last step
 					);
 					results.push(result);
 				}
 
-				const lines = results.map((r, i) => {
-					const runId = r.errorMessage?.match(/Run ID: ([\w-]+)/)?.[1] ?? "?";
-					return `${i + 1}. [${r.agent}] → ${runId}`;
-				});
+				const lastResult = results[results.length - 1];
 				return {
-					content: [{ type: "text", text: `Chain launched (${results.length} steps). Use subagent_status to track.\n${lines.join("\n")}` }],
-					details: makeDetails("chain")(results),
+					content: [{ type: "text", text: getFinalOutput(lastResult.messages) || "(no output)" }],
+					details: {
+						...makeDetails("chain")(results),
+						runId: lastResult.runId,
+					},
 				};
 			}
 
@@ -603,6 +800,26 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme, _context) {
+			// Action routing display
+			if (args.action === "resume") {
+				const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+				let text =
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("accent", "resume") +
+					theme.fg("dim", ` ${args.runId}`);
+				text += `\n  ${theme.fg("dim", preview)}`;
+				if (args.keepAlive) text += theme.fg("muted", " [keep-alive]");
+				return new Text(text, 0, 0);
+			}
+			if (args.action === "release") {
+				return new Text(
+					theme.fg("toolTitle", theme.bold("subagent ")) +
+					theme.fg("warning", "release") +
+					theme.fg("dim", ` ${args.runId}`),
+					0, 0,
+				);
+			}
+
 			const scope: AgentScope = args.agentScope ?? "user";
 			if (args.chain && args.chain.length > 0) {
 				let text =
@@ -714,6 +931,9 @@ export default function (pi: ExtensionAPI) {
 						container.addChild(new Spacer(1));
 						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
 					}
+					if (details.runId) {
+						container.addChild(new Text(theme.fg("accent", `run: ${details.runId} (idle)`), 0, 0));
+					}
 					return container;
 				}
 
@@ -728,6 +948,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const usageStr = formatUsageStats(r.usage, r.model);
 				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
+				if (details.runId) text += `\n${theme.fg("accent", `run: ${details.runId} (idle)`)}`;
 				return new Text(text, 0, 0);
 			}
 
@@ -1129,15 +1350,22 @@ export default function (pi: ExtensionAPI) {
 			const discovery = discoverAgents(ctx.cwd, "both");
 			const agentList = discovery.agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 			const activeAsyncRuns = getActiveRunCount();
+			const pooledCount = getPoolSize();
+			const pooledIds = getPoolRunIds();
+			const totalChildren = activeAsyncRuns + pooledCount;
 
 			const lines = [
 				"Subagent Extension",
 				"extension: loaded",
 				`agents: ${agentList}`,
 				"transport: rpc (--mode rpc)",
-				`active async runs: ${activeAsyncRuns}`,
+				`child processes: ${totalChildren}/${MAX_TOTAL_CHILDREN} (async: ${activeAsyncRuns}, pooled: ${pooledCount})`,
 				`config: idleTimeoutMs=${subagentConfig.idleTimeoutMs}`,
 			];
+
+			if (pooledIds.length > 0) {
+				lines.push(`pooled sessions: ${pooledIds.join(", ")}`);
+			}
 
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
