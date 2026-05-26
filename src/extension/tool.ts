@@ -12,7 +12,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -275,7 +275,6 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	asyncMode: boolean = false,
-	ctx?: ExtensionContext,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -371,70 +370,14 @@ async function runSingleAgent(
 			}
 		});
 
-		// Handle UI requests: forward to parent user via ctx.ui, or auto-respond if no ctx
-		session.onUIRequest(async (req) => {
+		// Framework UI requests from child — cancel with error.
+		// Subagent must NOT call ctx.ui; decisions go through contact_supervisor.
+		// Cancelling ensures any accidental ctx.ui usage fails visibly.
+		session.onUIRequest((req) => {
 			const fireAndForget = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
 			if (fireAndForget.includes(req.method)) return;
-
-			// Forward interactive requests to parent user
-			if (ctx) {
-				try {
-					if (req.method === "confirm") {
-						const confirmed = await ctx.ui.confirm(
-							String(req.title ?? "Child Agent Confirmation"),
-							String(req.message ?? "Confirm?"),
-						);
-						session.respondToUIRequest(req.id, { confirmed });
-					} else if (req.method === "input") {
-						const value = await ctx.ui.input(
-							String(req.title ?? "Child Agent Input"),
-							req.placeholder as string | undefined,
-						);
-						if (value !== undefined) {
-							session.respondToUIRequest(req.id, { value });
-						} else {
-							session.respondToUIRequest(req.id, { cancelled: true });
-						}
-					} else if (req.method === "select") {
-						const opts = req.options as string[] | undefined;
-						const value = await ctx.ui.select(
-							String(req.title ?? "Child Agent Selection"),
-							opts ?? [],
-						);
-						if (value !== undefined) {
-							session.respondToUIRequest(req.id, { value });
-						} else {
-							session.respondToUIRequest(req.id, { cancelled: true });
-						}
-					} else if (req.method === "editor") {
-						// editor: use input as approximation (no editor in ctx.ui)
-						const value = await ctx.ui.input(
-							String(req.title ?? "Child Agent Editor"),
-							req.prefill as string | undefined,
-						);
-						if (value !== undefined) {
-							session.respondToUIRequest(req.id, { value });
-						} else {
-							session.respondToUIRequest(req.id, { cancelled: true });
-						}
-					} else {
-						session.respondToUIRequest(req.id, { cancelled: true });
-					}
-				} catch {
-					// If parent UI fails, auto-respond to avoid blocking child
-					session.respondToUIRequest(req.id, { cancelled: true });
-				}
-				return;
-			}
-
-			// Fallback: auto-respond with defaults (no ctx available)
-			if (req.method === "confirm") session.respondToUIRequest(req.id, { confirmed: true });
-			else if (req.method === "input") session.respondToUIRequest(req.id, { value: String(req.default_value ?? "") });
-			else if (req.method === "select") {
-				const opts = req.options as string[] | undefined;
-				session.respondToUIRequest(req.id, { value: opts?.[0] ?? "" });
-			} else if (req.method === "editor") session.respondToUIRequest(req.id, { value: String(req.prefill ?? "") });
-			else session.respondToUIRequest(req.id, { cancelled: true });
+			// Interactive UI request: cancel — subagent should use contact_supervisor instead
+			session.respondToUIRequest(req.id, { cancelled: true });
 		});
 
 		// Wire abort signal
@@ -472,28 +415,12 @@ async function runSingleAgent(
 		};
 	}
 
-	// Handle extension UI requests (confirm/input from child)
-	// NOTE: async mode already returned to caller — ctx is no longer available,
-	// so we must auto-respond. Sync mode (above) forwards to parent user instead.
+	// Framework UI requests from child — cancel with error.
+	// Same as sync mode: subagent must not call ctx.ui.
 	const uiUnsubscribe = session.onUIRequest((req) => {
-		// Fire-and-forget methods: notify, setStatus, setTitle, setWidget, set_editor_text
 		const fireAndForget = ["notify", "setStatus", "setTitle", "setWidget", "set_editor_text"];
-		if (fireAndForget.includes(req.method)) {
-			return;
-		}
-		// Auto-respond with sensible defaults for async mode
-		if (req.method === "confirm") {
-			session.respondToUIRequest(req.id, { confirmed: true });
-		} else if (req.method === "input") {
-			session.respondToUIRequest(req.id, { value: String(req.default_value ?? "") });
-		} else if (req.method === "select") {
-			const opts = req.options as string[] | undefined;
-			session.respondToUIRequest(req.id, { value: opts?.[0] ?? "" });
-		} else if (req.method === "editor") {
-			session.respondToUIRequest(req.id, { value: String(req.prefill ?? "") });
-		} else {
-			session.respondToUIRequest(req.id, { cancelled: true });
-		}
+		if (fireAndForget.includes(req.method)) return;
+		session.respondToUIRequest(req.id, { cancelled: true });
 	});
 
 	// Track events for accumulation
@@ -577,45 +504,25 @@ export default function (pi: ExtensionAPI) {
 		pi.registerTool({
 			name: "contact_supervisor",
 			label: "Contact Supervisor",
-			description: "Send a message to the parent agent (supervisor). Use 'progress' for status updates, 'decision' for questions that need parent input.",
+			description: "Send a message to the parent agent (supervisor). Use 'progress' for status updates, 'decision' for questions that need parent input. The parent will see your message in the task results and may respond via a follow-up steer.",
 			parameters: ContactSupervisorParams,
 
-			async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<AgentToolResult<undefined>> {
+			async execute(_toolCallId, params, _signal, _onUpdate, _ctx): Promise<AgentToolResult<undefined>> {
 				if (params.type === "progress") {
-					// Fire-and-forget notification to parent
-					ctx.ui.notify(`[child] ${params.message}`, "info");
+					// Progress update — returned as tool result text, visible to parent in output
 					return {
-						content: [{ type: "text", text: "Progress update sent to supervisor." }],
+						content: [{ type: "text", text: `[progress] ${params.message}` }],
 						details: undefined,
 					};
 				}
 
 				if (params.type === "decision") {
-					// Blocking request — use ctx.ui.confirm or ctx.ui.input
-					if (params.options && params.options.length > 0) {
-						// Use confirm-style if 2 options, select for more
-						if (params.options.length <= 2) {
-							const question = `${params.message}\n\nOptions: ${params.options.join(" / ")}`;
-							const confirmed = await ctx.ui.confirm("Supervisor Decision Required", question);
-							const chosen = confirmed ? params.options[0] : (params.options[1] || params.options[0]);
-							return {
-								content: [{ type: "text", text: `Supervisor chose: ${chosen}` }],
-								details: undefined,
-							};
-						}
-						// Multiple options: use input (select not available in all modes)
-						const question = `${params.message}\n\nOptions: ${params.options.join(", ")}`;
-						const answer = await ctx.ui.input("Supervisor Decision Required", question);
-						return {
-							content: [{ type: "text", text: answer || params.default_value || "No response from supervisor." }],
-							details: undefined,
-						};
-					}
-
-					// Free-form question
-					const answer = await ctx.ui.input("Supervisor Decision Required", params.message);
+					// Decision request — returned as tool result text for parent to see.
+					// Parent LLM can respond via subagent_steer or followUp.
+					const opts = params.options?.length ? ` Options: ${params.options.join(", ")}` : "";
+					const dv = params.default_value ? ` Default: ${params.default_value}` : "";
 					return {
-						content: [{ type: "text", text: answer || params.default_value || "No response from supervisor." }],
+						content: [{ type: "text", text: `[decision-request] ${params.message}${opts}${dv}\nWaiting for supervisor response via steer.` }],
 						details: undefined,
 					};
 				}
@@ -733,8 +640,6 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
-						false,
-						ctx,
 					);
 					results.push(result);
 
@@ -812,8 +717,6 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 						makeDetails("parallel"),
-						false,
-						ctx,
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -861,7 +764,6 @@ export default function (pi: ExtensionAPI) {
 					onUpdate,
 					makeDetails("single"),
 					isAsync,
-					ctx,
 				);
 
 				if (isAsync) {
