@@ -1120,6 +1120,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ── Context management (parent mode) ──
+	registerContextManagement(pi);
+
 	// Register the `/doctor` command
 	pi.registerCommand("doctor", {
 		description: "Check subagent extension status",
