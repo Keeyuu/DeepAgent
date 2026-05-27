@@ -31,10 +31,11 @@ There are two token numbers:
 
 Nudge behavior:
 
-- No active lens: compare `rawTokens / budget`.
-- Active lens: compare `lensTokens / budget`.
-- If `rawTokens` is high but `lensTokens` is healthy, report that the raw session is large but the active lens is controlling provider context.
-- If `lensTokens` is high, instruct the agent to refresh the lens with `compress`.
+- **Below info threshold (default < 60%): no injection.** Agent context is clean — no usage stats, no tool hints.
+- Info (≥ 60%): inject gentle reminder with `context_usage` stats + suggestion to consider `compress`.
+- Warning (≥ 70%): stronger prompt — tail is growing, refresh lens soon.
+- Critical (≥ 80%): urgent — agent MUST call `compress` now.
+- No active lens: compare `rawTokens / budget`. Active lens: compare `lensTokens / budget`.
 
 Lens application is deterministic:
 
@@ -101,9 +102,9 @@ import type { ContextEvent } from "@earendil-works/pi-coding-agent";
 export type ContextMessage = ContextEvent["messages"][number];
 
 export interface CompressParams {
-  focus: string;
-  filter: string;
-  guideline: string;
+  focus: string;  // 保留哪些内容
+  filter: string; // 丢弃哪些内容
+  guideline: string; // 核心意图：压缩完要接着干什么
   retainRecentTurns?: number;
 }
 
@@ -142,12 +143,29 @@ export interface ContextUsageSnapshot {
   level: "none" | "info" | "warning" | "critical";
 }
 
+export interface NudgeTemplates {
+  info?: string;
+  warning?: string;
+  critical?: string;
+}
+
+export interface ModelContextOverride {
+  /** 模型 ID 或前缀匹配 */
+  model: string;
+  budget?: number;
+  nudgeThreshold?: number;
+  nudgeUrgent?: number;
+  nudgeTemplates?: NudgeTemplates;
+}
+
 export interface ContextConfig {
   budget: number;
   nudgeThreshold: number;
   nudgeUrgent: number;
   retainRecentTurns: number;
   summaryPromptPath: string;
+  nudgeTemplates?: NudgeTemplates;
+  modelOverrides?: ModelContextOverride[];
 }
 ```
 
@@ -475,7 +493,7 @@ export function usageForMessages(
   rawMessages: readonly ContextMessage[],
   activeLens: ContextLens | undefined,
   budget: number,
-  thresholds: { nudgeThreshold: number; nudgeUrgent: number } = { nudgeThreshold: 0.7, nudgeUrgent: 0.9 },
+  thresholds: { nudgeThreshold: number; nudgeUrgent: number } = { nudgeThreshold: 0.6, nudgeUrgent: 0.8 },
 ): ContextUsageSnapshot {
   const rawTokens = estimateMessagesTokens(rawMessages);
   const effectiveLens = activeLens && isLensCursorValid(rawMessages, activeLens) ? activeLens : undefined;
@@ -722,14 +740,22 @@ import {
 } from "./context-lens.ts";
 import { completeWithPi, summarizeForLens } from "./context-compactor.ts";
 import { estimateMessagesTokens } from "./token-estimator.ts";
-import type { CompressParams, ContextConfig, ContextLens, ContextLensCommand, ContextMessage } from "./types.ts";
+import type { CompressParams, ContextConfig, ContextLens, ContextLensCommand, ContextMessage, NudgeTemplates } from "./types.ts";
+
+const DEFAULT_NUDGE_TEMPLATES: NudgeTemplates = {
+  info: `<context-usage>\nContext at {{ratio}}% ({{usedTokens}} / {{budget}}).\nConsider using \`compress\` to focus the context.\n</context-usage>`,
+  warning: `<context-usage>\nContext at {{ratio}}% ({{usedTokens}} / {{budget}}).\nTail is growing — refresh the lens with \`compress\` soon.\n</context-usage>`,
+  critical: `<context-usage>\nCRITICAL: Context at {{ratio}}% ({{usedTokens}} / {{budget}}).\nYou MUST call \`compress\` NOW or the context window may overflow.\n</context-usage>`,
+};
 
 const DEFAULT_CONFIG: ContextConfig = {
   budget: 180000,
-  nudgeThreshold: 0.7,
-  nudgeUrgent: 0.9,
+  nudgeThreshold: 0.6,
+  nudgeUrgent: 0.8,
   retainRecentTurns: 3,
   summaryPromptPath: ".pi/prompts/context-lens.md",
+  nudgeTemplates: DEFAULT_NUDGE_TEMPLATES,
+  modelOverrides: [],
 };
 
 function readContextConfig(cwd: string): ContextConfig {
@@ -741,6 +767,20 @@ function readContextConfig(cwd: string): ContextConfig {
   } catch {
     return DEFAULT_CONFIG;
   }
+}
+
+/** Apply per-model overrides: match longest model key prefix */
+function resolveModelConfig(modelId: string | undefined, config: ContextConfig): ContextConfig {
+  if (!modelId || !config.modelOverrides?.length) return config;
+  const match = config.modelOverrides
+    .filter((o) => modelId.startsWith(o.model))
+    .sort((a, b) => b.model.length - a.model.length)[0];
+  if (!match) return config;
+  return { ...config, ...match };
+}
+
+function resolveEffectiveConfig(modelId: string | undefined): ContextConfig {
+  return resolveModelConfig(modelId, readContextConfig(process.cwd()));
 }
 
 function readPromptTemplate(cwd: string, config: ContextConfig): string {
@@ -860,11 +900,12 @@ export function registerContextManagement(pi: ExtensionAPI): void {
     description: "Report raw session context, active lens context, and whether the lens should be refreshed.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const effective = resolveModelConfig(ctx.model?.id, config);
       const rawMessages = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages as ContextMessage[];
       const activeLens = latestActiveLens(rawMessages, memoryLens);
-      const usage = usageForMessages(rawMessages, activeLens, config.budget, config);
+      const usage = usageForMessages(rawMessages, activeLens, effective.budget, effective);
       return {
-        content: [{ type: "text", text: formatUsageReport(usage) }],
+        content: [{ type: "text", text: formatUsageReport(usage, rawMessages.length) }],
         details: { contextUsage: usage },
       };
     },
@@ -877,20 +918,21 @@ export function registerContextManagement(pi: ExtensionAPI): void {
     parameters: Type.Object({
       focus: Type.String({ description: "What the lens summary must retain." }),
       filter: Type.String({ description: "What can be discarded or aggressively compressed." }),
-      guideline: Type.String({ description: "One-sentence summary policy." }),
+      guideline: Type.String({ description: "Core intent: what you aim to accomplish after compression." }),
       retainRecentTurns: Type.Optional(Type.Number({ description: "Recent user turns to keep raw. Defaults to contextManagement.retainRecentTurns." })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const effective = resolveModelConfig(ctx.model?.id, config);
       const rawMessages = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).messages as ContextMessage[];
       const previousLens = latestActiveLens(rawMessages, memoryLens);
-      const promptTemplate = readPromptTemplate(ctx.cwd, config);
-      const normalized = normalizeParams(params as CompressParams, config);
+      const promptTemplate = readPromptTemplate(ctx.cwd, effective);
+      const normalized = normalizeParams(params as CompressParams, effective);
       const lens = await createOrRefreshLens({
         ctx,
         rawMessages,
         previousLens,
         params: normalized,
-        config,
+        config: effective,
         promptTemplate,
         signal,
       });
@@ -992,11 +1034,17 @@ export function registerContextManagement(pi: ExtensionAPI): void {
 - [ ] **Step 4: Add formatting helpers**
 
 ```typescript
-function formatUsageReport(usage: ReturnType<typeof usageForMessages>): string {
+function formatUsageReport(usage: ReturnType<typeof usageForMessages>, totalMessages?: number): string {
   const rawK = Math.round(usage.rawTokens / 1000);
   const lensK = Math.round(usage.lensTokens / 1000);
   const budgetK = Math.round(usage.budget / 1000);
   const active = usage.activeLensId ? `active lens: ${usage.activeLensId}` : "active lens: none";
+  const rawLabel = totalMessages !== undefined
+    ? `raw context: ~${rawK}K tokens · ${totalMessages} messages`
+    : `raw context: ~${rawK}K tokens`;
+  const lensLabel = usage.activeLensId
+    ? `lens view:   ~${lensK}K / ${budgetK}K tokens · ${usage.retainedMessageCount ?? "?"} messages`
+    : `lens view:   ~${lensK}K / ${budgetK}K tokens (no active lens)`;
   const refreshHint = usage.activeLensId
     ? (usage.level !== "none"
         ? "Refresh the lens with compress if the retained tail grows too large."
@@ -1005,8 +1053,8 @@ function formatUsageReport(usage: ReturnType<typeof usageForMessages>): string {
         ? "No active lens — create one with compress to reduce context usage."
         : "No active lens and raw context is below threshold.");
   return [
-    `raw context: ~${rawK}K tokens`,
-    `lens view: ~${lensK}K / ${budgetK}K tokens`,
+    rawLabel,
+    lensLabel,
     active,
     `level: ${usage.level}`,
     refreshHint,
@@ -1016,23 +1064,28 @@ function formatUsageReport(usage: ReturnType<typeof usageForMessages>): string {
 function formatUsageNudge(usage: ReturnType<typeof usageForMessages>, config: ContextConfig): ContextMessage | undefined {
   const ratio = usage.usageRatio;
   if (ratio < config.nudgeThreshold) return undefined;
-  const action = usage.activeLensId
-    ? "Refresh the active context lens with compress to summarize the growing tail."
-    : "Create an active context lens with compress.";
+
+  const level = usage.level;
+  const templates = config.nudgeTemplates ?? DEFAULT_NUDGE_TEMPLATES;
+  const template = templates[level];
+  if (!template) return undefined;
+
+  const usedTokens = usage.activeLensId ? usage.lensTokens : usage.rawTokens;
+  const text = template
+    .replace(/\{\{ratio\}\}/g, String(Math.round(ratio * 100)))
+    .replace(/\{\{usedTokens\}\}/g, formatTokenCount(usedTokens))
+    .replace(/\{\{budget\}\}/g, formatTokenCount(usage.budget))
+    .replace(/\{\{level\}\}/g, level);
+
   return {
     role: "user",
-    content: [{
-      type: "text",
-      text: [
-        "<context-usage>",
-        `Context lens view is ${Math.round(ratio * 100)}% of budget.`,
-        `Raw tokens: ${usage.rawTokens}; lens tokens: ${usage.lensTokens}.`,
-        action,
-        "</context-usage>",
-      ].join("\n"),
-    }],
+    content: [{ type: "text", text }],
     timestamp: Date.now(),
   } as ContextMessage;
+}
+
+function formatTokenCount(n: number): string {
+  return n >= 1000 ? `${Math.round(n / 1000)}K` : String(n);
 }
 ```
 
@@ -1155,10 +1208,19 @@ Update `.pi/settings.json` by adding:
 ```json
 "contextManagement": {
   "budget": 180000,
-  "nudgeThreshold": 0.7,
-  "nudgeUrgent": 0.9,
+  "nudgeThreshold": 0.6,
+  "nudgeUrgent": 0.8,
   "retainRecentTurns": 3,
-  "summaryPromptPath": ".pi/prompts/context-lens.md"
+  "summaryPromptPath": ".pi/prompts/context-lens.md",
+  "nudgeTemplates": {
+    "info": "<context-usage>\nContext at {{ratio}}% ({{usedTokens}} / {{budget}}).\nConsider using `compress` to focus the context.\n</context-usage>",
+    "warning": "<context-usage>\nContext at {{ratio}}% ({{usedTokens}} / {{budget}}).\nTail is growing — refresh the lens with `compress` soon.\n</context-usage>",
+    "critical": "<context-usage>\nCRITICAL: Context at {{ratio}}% ({{usedTokens}} / {{budget}}).\nYou MUST call `compress` NOW.\n</context-usage>"
+  },
+  "modelOverrides": [
+    { "model": "DeepSeek-V3", "budget": 30000 },
+    { "model": "MiniMax-M2.7", "budget": 180000, "nudgeThreshold": 0.5 }
+  ]
 }
 ```
 

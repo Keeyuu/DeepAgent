@@ -34,6 +34,7 @@ import type {
 import { RpcSession } from "./rpc-session.ts";
 import { registerRun, getRun, removeRun, getActiveRunCount, getAllRuns } from "./run-registry.ts";
 import { addToPool, getFromPool, removeFromPool, updatePoolActivity, getPoolRunIds, getPoolSize, registerExitHandlers, MAX_TOTAL_CHILDREN } from "./session-pool.ts";
+import { registerContextManagement } from "./context-tools.ts";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -285,6 +286,7 @@ async function launchAgent(
 			SUBAGENT_DEPTH: String(parseInt(process.env.SUBAGENT_DEPTH || "0", 10) + 1),
 		},
 		model: agent.model,
+		thinking: agent.thinking,
 		tools: agent.tools,
 		systemPrompt: agent.systemPrompt,
 		args: ["-p"],
@@ -465,6 +467,7 @@ export default function (pi: ExtensionAPI) {
 				} as AgentToolResult<undefined>;
 			},
 		});
+		registerContextManagement(pi);
 		return;
 	}
 

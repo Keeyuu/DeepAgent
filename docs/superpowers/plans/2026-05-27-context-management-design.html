@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepAgent Context Management — Design Review</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --fg: #c9d1d9;
+  --muted: #8b949e;
+  --border: #30363d;
+  --accent: #58a6ff;
+  --success: #3fb950;
+  --warning: #d2991d;
+  --error: #f85149;
+  --code-bg: #161b22;
+  --surface: #161b22;
+  --hl: #1c2128;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+  line-height: 1.6;
+}
+body { max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
+h1 { font-size: 1.8rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
+h2 { font-size: 1.35rem; margin-top: 2.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+h3 { font-size: 1.1rem; margin-top: 1.8rem; color: var(--accent); }
+p, li { font-size: 0.95rem; }
+a { color: var(--accent); }
+code { background: var(--code-bg); padding: 0.15em 0.4em; border-radius: 4px; font-size: 0.9em; }
+pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.5; }
+pre code { background: none; padding: 0; }
+.keyword { color: #ff7b72; }
+.string { color: #a5d6ff; }
+.comment { color: #8b949e; }
+.type { color: #ffa657; }
+.func { color: #d2a8ff; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { border: 1px solid var(--border); padding: 0.5rem 0.75rem; text-align: left; font-size: 0.9rem; }
+th { background: var(--hl); }
+.badge { display: inline-block; padding: 0.1em 0.6em; border-radius: 10px; font-size: 0.78rem; font-weight: 600; }
+.badge-p0 { background: #f8514922; color: var(--error); border: 1px solid #f8514955; }
+.badge-p1 { background: #d2991d22; color: var(--warning); border: 1px solid #d2991d55; }
+.badge-ok { background: #3fb95022; color: var(--success); border: 1px solid #3fb95055; }
+.diagram { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1rem 0; font-family: 'Courier New', monospace; font-size: 0.82rem; white-space: pre; line-height: 1.5; overflow-x: auto; }
+.block { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.25rem; margin: 0.8rem 0; }
+.block-title { font-weight: 600; color: var(--accent); margin-bottom: 0.5rem; }
+ul, ol { padding-left: 1.5rem; }
+li { margin: 0.3rem 0; }
+.toc { margin: 1.5rem 0; }
+.toc li { list-style: none; margin: 0.4rem 0; }
+.toc li a { text-decoration: none; }
+.finding-list li { margin: 0.6rem 0; }
+.footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.82rem; }
+@media (max-width: 640px) { body { padding: 1rem 0.8rem; } .diagram { font-size: 0.72rem; } }
+</style>
+</head>
+<body>
+
+<h1>🧠 DeepAgent Context Management — Design Review</h1>
+<p style="color:var(--muted);margin-top:-0.5rem">
+  Active Context Lens · <a href="2026-05-27-context-management.md">implementation plan</a>
+</p>
+
+<!-- ── TOC ── -->
+<ul class="toc">
+  <li><a href="#architecture">1. 架构概览</a></li>
+  <li><a href="#key-decisions">2. 关键决策</a></li>
+  <li><a href="#pi-pipeline">3. Pi 管线集成</a></li>
+  <li><a href="#types">4. 类型定义</a></li>
+  <li><a href="#lifecycle">5. 生命周期</a></li>
+  <li><a href="#accounting">6. 上下文计量</a></li>
+  <li><a href="#tools">7. 工具接口</a></li>
+  <li><a href="#safety-net">8. 安全网</a></li>
+  <li><a href="#reentry">9. 重入 & 恢复</a></li>
+  <li><a href="#files">10. 文件结构</a></li>
+  <li><a href="#findings">11. Bug 修复记录</a></li>
+</ul>
+
+<!-- ── 1. Architecture ── -->
+<h2 id="architecture">1. 架构概览</h2>
+
+<div class="diagram">
+┌─────────────────────────────────────────────────────────────┐
+│                    Pi Session (raw, immutable)               │
+│  m0│m1│m2│m3│m4│m5│m6│m7│m8│m9│m10│... (append-only)     │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│  "context" hook (transformContext — every LLM call)          │
+│                                                              │
+│  1. resolveLatestLensCommand(messages) — 从 history 恢复 lens │
+│  2. isLensCursorValid() — fingerprint 校验 cursor 是否有效   │
+│  3. applyContextLens() — summary + tail                      │
+│  4. usageForMessages() — 计量 lensTokens / rawTokens         │
+│  5. formatUsageNudge() — 超阈值注入提醒                      │
+│                                                              │
+│  → 返回: [summary, ...retainedTail, ?nudgeMessage]          │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+                    LLM Provider
+</div>
+
+<p><strong>核心思想：</strong>Raw session 永不变。Lens 是每次 LLM 调用前的虚拟变换——<code>summary + messages.slice(cursorIndex)</code>。Provider 看到的是压缩视野，session 保留完整历史。</p>
+
+<div class="block">
+  <div class="block-title">设计参数</div>
+  <code>compress(focus, filter, guideline)</code><br>
+  <code>focus</code>: 自由文本 — 摘要中必须保留的内容<br>
+  <code>filter</code>: 自由文本 — 可以丢弃/简化的内容<br>
+  <code>guideline</code>: 一句话 — 核心意图：压缩完要接着干什么<br><br>
+  Nudge 默认阈值：60% info / 80% urgent。支持按模型覆盖。
+  Lens 边界是 <code>compressedThroughMessageCount</code>，一个指向 raw 消息数组的整数下标（不用 AgentMessage.id，因为 Pi 消息没有稳定 ID）。
+</div>
+
+<!-- ── 2. Key Decisions ── -->
+<h2 id="key-decisions">2. 关键决策</h2>
+
+<table>
+<tr><th>决策</th><th>理由</th></tr>
+<tr>
+  <td><strong>Active lens，非 one-shot block</strong></td>
+  <td>Lens 创建后持续生效，直到被新 compress 替换或 clear 关闭。Provider 每个 turn 自动看到压缩视野。</td>
+</tr>
+<tr>
+  <td><strong>不用 AgentMessage.id，用数组下标</strong></td>
+  <td>Pi 的 context hook 传入的 message 没有稳定 ID。compressedThroughMessageCount 是指向 raw 消息数组的整数游标。</td>
+</tr>
+<tr>
+  <td><strong>Cursor 是 array-shape scoped</strong></td>
+  <td>游标只对创建它的 array shape 有效。Native compaction / fork / tree nav 会改 array shape → cursor 失效。sourceFingerprint 检测 mismatch。</td>
+</tr>
+<tr>
+  <td><strong>用量按 provider view 算</strong></td>
+  <td>有 active lens 时，nudge 阈值用 lensTokens（transformed view），因为那是 LLM 实际收到的。</td>
+</tr>
+<tr>
+  <td><strong>Refresh 是增量的</strong></td>
+  <td>不反复摘要整个 raw session。Refresh 时输入 = 旧 summary + 旧边界后的新消息。</td>
+</tr>
+<tr>
+  <td><strong>重入 source of truth = 持久化 tool results</strong></td>
+  <td>内存 memoryLens 只是 cache。每次 context hook 从 toolResult.details.contextLens 反扫恢复。keep-alive resume / 进程重启可恢复。</td>
+</tr>
+<tr>
+  <td><strong>摘要必须是语义的</strong></td>
+  <td>不用占位符。第一次 compress 就用 LLM 生成语义摘要。失败则保持旧 lens + 返回 error。</td>
+</tr>
+<tr>
+  <td><strong>Native auto-compaction 不是正常控制环</strong></td>
+  <td>Pi 的 threshold auto-compaction 检查 assistantMessage.usage（lens 后的视野），不是 raw history。所以 raw session 增长不会触发它。Native compaction 只是最后兜底。</td>
+</tr>
+</table>
+
+<!-- ── 3. Pi Pipeline ── -->
+<h2 id="pi-pipeline">3. Pi 管线集成</h2>
+
+<div class="diagram">
+Pi Agent Loop (each turn):
+
+  buildSessionContext() ──→ AgentMessage[]
+       │
+       ▼
+  transformContext     ──→ "context" hook ──→ DeepAgent: apply lens + nudge
+       │
+       ▼
+  convertToLlm()      ──→ Anthropic/OpenAI Message[]
+       │
+       ▼
+  LLM Provider Call
+       │
+       ▼
+  AssistantMessage.usage ──→ Pi _checkCompaction(assistantMessage.usage)
+                              ↑
+                              │ uses provider usage (lens view)
+                              │ → won't trigger from raw session growth
+</div>
+
+<p><strong>Hook 注册：</strong><code>pi.on("context", handler)</code> — 每次 LLM 调用前自动调用。Extension 运行在 child 模式。</p>
+
+<p><strong>关键事实：</strong>Pi threshold auto-compaction 检查 <code>assistantMessage.usage</code>，这是 <em>实际 provider request</em> 的用量。Active lens 在 context hook 中生效，在 provider call 之前。所以正常成功回合的 usage 是 lens 视野的用量，不是 raw session 全量。Raw session 再大，只要 lens 视野不超窗，Pi 就不会触发 auto-compaction。</p>
+
+<!-- ── 4. Types ── -->
+<h2 id="types">4. 类型定义</h2>
+
+<pre><code><span class="keyword">export type</span> <span class="type">ContextMessage</span> = ContextEvent[<span class="string">"messages"</span>][<span class="keyword">number</span>];
+
+<span class="keyword">export interface</span> <span class="type">CompressParams</span> {
+  focus: <span class="keyword">string</span>;             <span class="comment">// 自由文本：摘要中必须保留的内容</span>
+  filter: <span class="keyword">string</span>;            <span class="comment">// 自由文本：可丢弃/简化的内容</span>
+  guideline: <span class="keyword">string</span>;         <span class="comment">// 一句话：核心意图（压缩完要接着干什么）</span>
+  retainRecentTurns?: <span class="keyword">number</span>;
+}
+
+<span class="keyword">export interface</span> <span class="type">ContextLens</span> {
+  version: <span class="keyword">1</span>;
+  id: <span class="keyword">string</span>;
+  previousLensId?: <span class="keyword">string</span>;
+  summary: <span class="keyword">string</span>;         <span class="comment">// LLM 生成的语义摘要</span>
+  params: <span class="type">Required&lt;CompressParams&gt;</span>;
+  compressedThroughMessageCount: <span class="keyword">number</span>;  <span class="comment">// cursor into raw[]</span>
+  sourceFingerprint: <span class="keyword">string</span>; <span class="comment">// SHA-256 of prefix before cursor</span>
+  retainedMessageCountAtCreation: <span class="keyword">number</span>;
+  rawTokensAtCreation: <span class="keyword">number</span>;
+  lensTokensAtCreation: <span class="keyword">number</span>;
+  createdAt: <span class="keyword">number</span>;
+  updatedAt: <span class="keyword">number</span>;
+}
+
+<span class="keyword">export interface</span> <span class="type">ContextLensCommand</span> {
+  version: <span class="keyword">1</span>;
+  command: <span class="string">"activate"</span> | <span class="string">"clear"</span>;
+  lens?: <span class="type">ContextLens</span>;
+  lensId?: <span class="keyword">string</span>;
+  createdAt: <span class="keyword">number</span>;
+}
+
+<span class="keyword">export interface</span> <span class="type">NudgeTemplates</span> {
+  info?: <span class="keyword">string</span>;      <span class="comment">// ≥60% gentle 提醒模板</span>
+  warning?: <span class="keyword">string</span>;   <span class="comment">// ≥70% upgrade 提醒模板</span>
+  critical?: <span class="keyword">string</span>;  <span class="comment">// ≥80% urgent 提醒模板</span>
+}
+
+<span class="keyword">export interface</span> <span class="type">ModelContextOverride</span> {
+  model: <span class="keyword">string</span>;           <span class="comment">// 模型 ID 或前缀匹配</span>
+  budget?: <span class="keyword">number</span>;
+  nudgeThreshold?: <span class="keyword">number</span>;
+  nudgeUrgent?: <span class="keyword">number</span>;
+  nudgeTemplates?: <span class="type">NudgeTemplates</span>;
+}
+
+<span class="keyword">export interface</span> <span class="type">ContextConfig</span> {
+  budget: <span class="keyword">number</span>;              <span class="comment">// default: 180000</span>
+  nudgeThreshold: <span class="keyword">number</span>;     <span class="comment">// default: 0.6</span>
+  nudgeUrgent: <span class="keyword">number</span>;       <span class="comment">// default: 0.8</span>
+  retainRecentTurns: <span class="keyword">number</span>;   <span class="comment">// default: 3</span>
+  summaryPromptPath: <span class="keyword">string</span>;   <span class="comment">// default: .pi/prompts/context-lens.md</span>
+  nudgeTemplates?: <span class="type">NudgeTemplates</span>;
+  modelOverrides?: <span class="type">ModelContextOverride</span>[];
+}</code></pre>
+
+<!-- ── 5. Lifecycle ── -->
+<h2 id="lifecycle">5. 生命周期</h2>
+
+<div class="block">
+  <div class="block-title">创建 (compress)</div>
+  <div class="diagram">
+Agent calls compress(focus, filter, guideline)
+  ↓
+calculateLensBoundary(rawMessages, retainTurns) → boundary index
+  ↓
+summarizeForLens(messages[0 .. boundary], params, template)
+  → LLM 调用 → semantic summary
+  ↓
+ContextLens {
+  summary,
+  compressedThroughMessageCount: boundary,
+  sourceFingerprint: SHA-256(rawMessages[0..boundary])
+}
+  ↓
+Store in toolResult.details.contextLens → persisted in session
+  </div>
+</div>
+
+<div class="block">
+  <div class="block-title">应用 (every context hook)</div>
+  <div class="diagram">
+resolveLatestLensCommand(messages) → find latest activate/clear
+  ↓ (if activate)
+isLensCursorValid(raw, lens)? — fingerprint match?
+  ↓ (yes)
+applyContextLens(raw, lens):
+  [summaryMsg, ...raw.slice(lens.compressedThroughMessageCount)]
+  ↓ (no - fingerint mismatch or clear)
+return [...raw] — bypass lens (full raw context)
+  </div>
+</div>
+
+<div class="block">
+  <div class="block-title">刷新 (compress again)</div>
+  <div class="diagram">
+newBoundary = max(oldBoundary, calculateLensBoundary(now))
+  ↓
+messagesToSummarize = [
+  oldLensSummary (as user msg),
+  ...raw.slice(oldBoundary, newBoundary)
+]
+  ↓
+summarizeForLens() → newSummary
+  ↓
+newLens = { summary: newSummary, boundary: newBoundary, previousLensId: oldLens.id }
+  </div>
+</div>
+
+<div class="block">
+  <div class="block-title">清除 (clear_context_lens)</div>
+  <div class="diagram">
+Agent calls clear_context_lens()
+  ↓
+Return toolResult with details.contextLens = { command: "clear" }
+  ↓
+Next context hook: resolveLatestLensCommand finds clear → returns undefined
+  ↓
+Provider sees full raw context (lens disabled)
+  </div>
+</div>
+
+<!-- ── 6. Accounting ── -->
+<h2 id="accounting">6. 上下文计量</h2>
+
+<p>两套 token 数字，由 <code>usageForMessages()</code> 每 turn 计算：</p>
+
+<table>
+<tr><th>指标</th><th>含义</th><th>用途</th></tr>
+<tr>
+  <td><code>rawTokens</code></td>
+  <td>未修改 Pi session 的 token 估算</td>
+  <td>监控 raw session 体量</td>
+</tr>
+<tr>
+  <td><code>lensTokens</code></td>
+  <td>变换后 provider view 的 token 估算</td>
+  <td>nudge 阈值比较</td>
+</tr>
+</table>
+
+<p><strong>估算方式：</strong><code>estimateMessagesTokens()</code> — 启发式 4 latin chars ≈ 1 token，1 CJK char ≈ 1 token，每条消息 +4 overhead。</p>
+
+<p><strong>Nudge 逻辑：每个 turn 达到阈值后注入一次。阈值可配，模板可覆盖。</strong></p>
+
+<table>
+<tr><th>级别</th><th>触发</th><th>行为</th><th>模板变量</th></tr>
+<tr><td>none</td><td>&lt; 60%</td><td>不注入，Agent 上下文干净</td><td>-</td></tr>
+<tr><td>info</td><td>≥ 60%</td><td>每次 turn 注入 gentle 提醒</td><td><code>{{ratio}}</code>, <code>{{usedTokens}}</code>, <code>{{budget}}</code>, <code>{{level}}</code></td></tr>
+<tr><td>warning</td><td>≥ 70%</td><td>每次 turn 注入 upgrade 提醒</td><td>同上</td></tr>
+<tr><td>critical</td><td>≥ 80%</td><td>每次 turn 注入 urgent 提醒</td><td>同上</td></tr>
+</table>
+
+<p><strong>默认模板（无符号，纯文本，可通过 <code>nudgeTemplates</code> 覆盖）：</strong></p>
+<pre><code>info:     "Context at {{ratio}}% ({{usedTokens}} / {{budget}}). Consider using compress to focus the context."
+warning:  "Context at {{ratio}}% ({{usedTokens}} / {{budget}}). Tail is growing — refresh the lens with compress soon."
+critical: "CRITICAL: Context at {{ratio}}% ({{usedTokens}} / {{budget}}). You MUST call compress NOW."</code></pre>
+
+<!-- ── 7. Tools ── -->
+<h2 id="tools">7. 工具接口</h2>
+
+<table>
+<tr><th>工具</th><th>功能</th><th>LLM 何时调用</th></tr>
+<tr>
+  <td><code>compress(focus, filter, guideline, retainRecentTurns?)</code></td>
+  <td>创建或刷新 active lens。LLM 生成语义摘要。</td>
+  <td>首次聚焦 / 旧 lens 视野接近预算</td>
+</tr>
+<tr>
+  <td><code>context_usage()</code></td>
+  <td>报告 rawTokens / lensTokens / 是否该刷新</td>
+  <td>检查当前状态</td>
+</tr>
+<tr>
+  <td><code>clear_context_lens()</code></td>
+  <td>关闭 active lens，恢复 full raw context</td>
+  <td>需要看到完整历史时</td>
+</tr>
+</table>
+
+<!-- ── 8. Safety Net ── -->
+<h2 id="safety-net">8. 安全网 — Native Compaction</h2>
+
+<p>正常路径不依赖 Pi auto-compaction。四层保障：</p>
+
+<table>
+<tr><th>事件</th><th>行为</th><th>原因</th></tr>
+<tr>
+  <td><code>session_before_compact</code></td>
+  <td><code>return undefined</code> — 不注入自定义 compaction</td>
+  <td>Pi 的 firstKeptEntryId 可能和 lens boundary 不同，注入会丢 delta</td>
+</tr>
+<tr>
+  <td><code>session_compact</code></td>
+  <td>清 in-memory lens + 持久化 clear marker</td>
+  <td>Native compaction 改写了 message array，旧 cursor 不可靠</td>
+</tr>
+<tr>
+  <td><code>session_tree</code></td>
+  <td>清 in-memory lens + 持久化 clear marker</td>
+  <td>Tree nav 加载新 array shape，旧 cursor 不可靠</td>
+</tr>
+<tr>
+  <td><code>session_before_fork</code></td>
+  <td>清 in-memory lens + 持久化 clear marker</td>
+  <td>Fork 复制消息到新分支，旧 cursor 在新分支不可靠</td>
+</tr>
+</table>
+
+<p>Clear marker 通过 <code>pi.sendMessage()</code> 注入，确保 <code>resolveLatestLensCommand</code> 即使在新分支/compacted context 中也能找到它。</p>
+
+<!-- ── 9. Re-entry ── -->
+<h2 id="reentry">9. 重入 & 恢复</h2>
+
+<div class="diagram">
+Process restart / keep-alive resume:
+  ↓
+"context" hook fires
+  ↓
+resolveLatestLensCommand(messages)
+  → walks toolResults backwards
+  → finds last { details: { contextLens: { version:1, command:"activate"|"clear", lens:... } } }
+  ↓
+if latest = clear → no lens
+if latest = activate → lens from persisted command
+  ↓
+isLensCursorValid() — fingerprint still matches?
+  yes → apply lens
+  no  → ignore lens (needs fresh compress)
+</div>
+
+<p><strong>In-memory <code>memoryLens</code></strong> 是纯 cache。每次 context hook 优先从 persisted tool results 恢复。只有持久化的 lens 里找不到 activate command 时，才 fallback 到 memoryLens。</p>
+
+<!-- ── 10. File Structure ── -->
+<h2 id="files">10. 文件结构</h2>
+
+<table>
+<tr><th>文件</th><th>职责</th></tr>
+<tr><td><code>src/extension/types.ts</code> <span class="badge badge-ok">modify</span></td><td>ContextLens, ContextLensCommand, CompressParams, ContextConfig, ContextUsageSnapshot</td></tr>
+<tr><td><code>src/extension/token-estimator.ts</code> <span class="badge badge-ok">new</span></td><td>Token 估算 (heuristic: latin 4:1, CJK 1:1)</td></tr>
+<tr><td><code>src/extension/context-lens.ts</code> <span class="badge badge-ok">new</span></td><td>Pure logic: applyContextLens, isLensCursorValid, calculateLensSourceFingerprint, resolveLatestLensCommand, usageForMessages, calculateLensBoundary</td></tr>
+<tr><td><code>src/extension/context-compactor.ts</code> <span class="badge badge-ok">new</span></td><td>LLM summarization: renderLensPrompt, buildLensPrompt, summarizeForLens, completeWithPi</td></tr>
+<tr><td><code>src/extension/context-tools.ts</code> <span class="badge badge-ok">new</span></td><td>Child-mode registration: compress, context_usage, clear_context_lens tools + context hooks</td></tr>
+<tr><td><code>src/extension/tool.ts</code> <span class="badge badge-ok">modify</span></td><td>Import + call registerContextManagement(pi) in child mode</td></tr>
+<tr><td><code>.pi/prompts/context-lens.md</code> <span class="badge badge-ok">new</span></td><td>Summary prompt template with {{focus}}/{{filter}}/{{guideline}} placeholders</td></tr>
+<tr><td><code>.pi/settings.json</code> <span class="badge badge-ok">modify</span></td><td>Optional contextManagement defaults</td></tr>
+</table>
+
+<!-- ── 11. Bug Fix Record ── -->
+<h2 id="findings">11. Bug 修复记录</h2>
+
+<p>计划审查中发现并修复的问题：</p>
+
+<ol class="finding-list">
+  <li><span class="badge badge-p0">P0</span> <strong><code>ctx.sessionManager.buildSessionContext()</code> 编译失败</strong>
+    <br>→ 改为 <code>buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId())</code> + import from <code>@earendil-works/pi-coding-agent</code></li>
+
+  <li><span class="badge badge-p0">P0</span> <strong><code>session_before_compact</code> 会用 <code>latest.summary</code> 当 compaction summary，丢 delta</strong>
+    <br>→ 改为 <code>return undefined</code>，让 Pi 默认压缩处理。session_compact 里 clear + persist clear marker。</li>
+
+  <li><span class="badge badge-p1">P1</span> <strong>fork/tree reset 只清 memoryLens，会从 persisted toolResult 恢复旧 lens</strong>
+    <br>→ <code>session_tree</code> / <code>session_before_fork</code> / <code>session_compact</code> 全部加 <code>pi.sendMessage()</code> 持久化 clear marker。</li>
+
+  <li><span class="badge badge-p1">P1</span> <strong>sourceFingerprint 只 hash index + role + toolName + text</strong>
+    <br>→ 加 algorithm version <code>"v2:"</code> + <code>isError</code> + <code>timestamp</code> 字段。hash 截短到 16 hex chars。</li>
+
+  <li><span class="badge badge-p1">P1</span> <strong><code>retainRecentTurns &lt;= 0</code> 返回 messages.length，有 orphan toolResult 风险</strong>
+    <br>→ <code>Math.max(1, retainRecentTurns)</code> 强制至少保留 1 个 user turn。</li>
+
+  <li><span class="badge badge-p1">P1</span> <strong><code>ContextUsageSnapshot</code> 缺 <code>nudgeThreshold</code> 字段</strong>
+    <br>→ 新增 <code>nudgeThreshold: number</code> 到类型，<code>usageForMessages()</code> 返回时填入。</li>
+
+  <li><span class="badge badge-p1">P2</span> <strong>summary prompt 构建用手写 <code>extractMessageText</code> 序列化</strong>
+    <br>→ 加 toolCall/toolResult content part 序列化。注：Phase 2 应改用 Pi convertToLlm。</li>
+
+  <li><span class="badge badge-p1">P2</span> <strong><code>formatUsageReport</code> 无 lens 但 raw 超阈值时说 "No refresh required"</strong>
+    <br>→ 改为 "No active lens — create one with compress to reduce context usage."</li>
+</ol>
+
+<div class="footer">
+  Generated 2026-05-27 · DeepAgent Active Context Lens Design · 
+  <a href="2026-05-27-context-management.md">full implementation plan</a>
+</div>
+
+</body>
+</html>

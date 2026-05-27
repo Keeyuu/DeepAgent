@@ -5,5 +5,21 @@
   "prompts": ["prompts/parent.md"],
   "skills": ["skills/subagent"],
   "enableSkillCommands": true,
-  "subagentIdleTimeoutMs": 300000
+  "subagentIdleTimeoutMs": 300000,
+  "contextManagement": {
+    "budget": 180000,
+    "nudgeThreshold": 0.6,
+    "nudgeUrgent": 0.8,
+    "retainRecentTurns": 3,
+    "summaryPromptPath": ".pi/prompts/context-lens.md",
+    "nudgeTemplates": {
+      "info": "<context-usage>\nContext at {{ratio}}% ({{usedTokens}} / {{budget}}).\nConsider using `compress` to focus the context.\n</context-usage>",
+      "warning": "<context-usage>\nContext at {{ratio}}% ({{usedTokens}} / {{budget}}).\nTail is growing — refresh the lens with `compress` soon.\n</context-usage>",
+      "critical": "<context-usage>\nCRITICAL: Context at {{ratio}}% ({{usedTokens}} / {{budget}}).\nYou MUST call `compress` NOW.\n</context-usage>"
+    },
+    "modelOverrides": [
+      { "model": "DeepSeek-V3", "budget": 30000 },
+      { "model": "MiniMax-M2.7", "budget": 180000, "nudgeThreshold": 0.5 }
+    ]
+  }
 }

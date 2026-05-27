@@ -14,6 +14,8 @@ export interface AgentConfig {
   description: string;
   tools?: string[];
   model?: string;
+  /** Pi CLI --thinking level: off, minimal, low, medium, high, xhigh */
+  thinking?: string;
   systemPrompt: string;
   filePath: string;
   source: "user" | "project" | "unknown";
@@ -137,4 +139,76 @@ export interface AsyncRunInfo {
   pendingDecision?: PendingDecision;
   /** Cleanup function to unsubscribe event listeners */
   unsubEvents?: () => void;
+}
+
+// --- Context management types ---
+
+import type { ContextEvent } from "@earendil-works/pi-coding-agent";
+
+export type ContextMessage = ContextEvent["messages"][number];
+
+export interface CompressParams {
+  focus: string;  // 保留哪些内容
+  filter: string; // 丢弃哪些内容
+  guideline: string; // 核心意图：压缩完要接着干什么
+  retainRecentTurns?: number;
+}
+
+export interface ContextLens {
+  version: 1;
+  id: string;
+  previousLensId?: string;
+  summary: string;
+  params: Required<CompressParams>;
+  compressedThroughMessageCount: number;
+  sourceFingerprint: string;
+  retainedMessageCountAtCreation: number;
+  rawTokensAtCreation: number;
+  lensTokensAtCreation: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ContextLensCommand {
+  version: 1;
+  command: "activate" | "clear";
+  lens?: ContextLens;
+  lensId?: string;
+  createdAt: number;
+}
+
+export interface ContextUsageSnapshot {
+  rawTokens: number;
+  lensTokens: number;
+  budget: number;
+  nudgeThreshold: number;
+  activeLensId?: string;
+  compressedThroughMessageCount?: number;
+  retainedMessageCount?: number;
+  usageRatio: number;
+  level: "none" | "info" | "warning" | "critical";
+}
+
+export interface NudgeTemplates {
+  info?: string;
+  warning?: string;
+  critical?: string;
+}
+
+export interface ModelContextOverride {
+  model: string;
+  budget?: number;
+  nudgeThreshold?: number;
+  nudgeUrgent?: number;
+  nudgeTemplates?: NudgeTemplates;
+}
+
+export interface ContextConfig {
+  budget: number;
+  nudgeThreshold: number;
+  nudgeUrgent: number;
+  retainRecentTurns: number;
+  summaryPromptPath: string;
+  nudgeTemplates?: NudgeTemplates;
+  modelOverrides?: ModelContextOverride[];
 }

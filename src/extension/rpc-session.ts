@@ -25,6 +25,8 @@ export interface RpcSessionOptions {
   env?: Record<string, string>;
   /** Model to use (passed as --model) */
   model?: string;
+  /** Thinking level: off, minimal, low, medium, high, xhigh (passed as --thinking) */
+  thinking?: string;
   /** Tools to enable (passed as --tools) */
   tools?: string[];
   /** System prompt to append (written to temp file, passed as --append-system-prompt) */
@@ -124,6 +126,9 @@ export class RpcSession {
 
     if (this.options.model) {
       args.push("--model", this.options.model);
+    }
+    if (this.options.thinking) {
+      args.push("--thinking", this.options.thinking);
     }
     if (this.options.tools && this.options.tools.length > 0) {
       args.push("--tools", this.options.tools.join(","));
