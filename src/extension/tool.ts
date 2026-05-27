@@ -15,7 +15,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, getMarkdownTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { discoverAgents } from "./agents.ts";
@@ -816,18 +816,26 @@ export default function (pi: ExtensionAPI) {
 					return container;
 				}
 
+				// Compact collapsed view — summary only, expand for details
 				let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 				if (isError && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				if (isPending && r.errorMessage) text += `\n${theme.fg("accent", r.errorMessage)}`;
-				else if (isError && r.errorMessage) text += `\n${theme.fg("error", `Error: ${r.errorMessage}`)}`;
-				else if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
-				else {
-					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
-					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+				if (isPending && r.errorMessage) {
+					text += ` ${theme.fg("accent", r.errorMessage)}`;
+				} else if (finalOutput) {
+					// Show first 2 lines of final output
+					const lines = finalOutput.split("\n").filter(l => l.trim()).slice(0, 2);
+					text += `\n  ${theme.fg("dim", lines.join("\n  "))}`;
+					if (finalOutput.split("\n").filter(l => l.trim()).length > 2) {
+						text += ` ${theme.fg("muted", "(" + keyHint("app.tools.expand", "expand") + ")")}`;
+					}
+				} else if (isError && r.errorMessage) {
+					text += `\n  ${theme.fg("error", r.errorMessage)}`;
+				} else {
+					text += ` ${theme.fg("muted", "(no output)")}`;
 				}
 				const usageStr = formatUsageStats(r.usage, r.model);
-				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
-				if (details.runId) text += `\n${theme.fg("accent", `run: ${details.runId} (idle)`)}`;
+				if (usageStr) text += ` ${theme.fg("dim", usageStr)}`;
+				if (details.runId) text += ` ${theme.fg("accent", `[${details.runId}]`)}`;
 				return new Text(text, 0, 0);
 			}
 
@@ -909,6 +917,7 @@ export default function (pi: ExtensionAPI) {
 				return container;
 			}
 
+			// Compact collapsed view — one line per task
 			let text = `${icon} ${theme.fg("toolTitle", theme.bold("tasks "))}${theme.fg("accent", status)}`;
 			for (const r of details.results) {
 				const rIcon =
@@ -917,17 +926,18 @@ export default function (pi: ExtensionAPI) {
 						: isFailedResult(r)
 							? theme.fg("error", "✗")
 							: theme.fg("success", "✓");
-				const displayItems = getDisplayItems(r.messages);
-				text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
-				if (displayItems.length === 0)
-					text += `\n${theme.fg("muted", r.exitCode === EXIT_CODE_PENDING ? "(running...)" : "(no output)")}`;
-				else text += `\n${renderDisplayItems(displayItems, 5)}`;
+				const out = getFinalOutput(r.messages);
+				const preview = out ? out.split("\n").filter((l: string) => l.trim()).slice(0, 1)[0] : undefined;
+				const taskPreview = r.task.length > 40 ? r.task.slice(0, 40) + "..." : r.task;
+				text += `\n  ${rIcon} ${theme.fg("accent", r.agent)} ${theme.fg("dim", taskPreview)}`;
+				if (preview) text += ` — ${theme.fg("muted", preview.slice(0, 60))}`;
+				else if (r.exitCode === EXIT_CODE_PENDING) text += ` ${theme.fg("muted", "(running)")}`;
 			}
 			if (!isRunning) {
 				const usageStr = formatUsageStats(aggregateUsage(details.results));
-				if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
+				if (usageStr) text += `\n  ${theme.fg("dim", usageStr)}`;
 			}
-			if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
+			text += `\n  ${theme.fg("muted", "(" + keyHint("app.tools.expand", "expand") + ")")}`;
 			return new Text(text, 0, 0);
 		},
 	});
